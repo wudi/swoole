@@ -7,7 +7,6 @@ swoole_server/event: onManagerStop
 require __DIR__ . '/../../include/bootstrap.php';
 
 use Swoole\Server;
-use SwooleTest\ProcessManager;
 use Swoole\Atomic;
 
 $pm = new SwooleTest\ProcessManager;
@@ -22,7 +21,7 @@ $pm->parentFunc = function () use ($pm) {
 };
 
 $pm->childFunc = function () use ($pm, $atomic) {
-    $serv = new Server('127.0.0.1', $pm->getFreePort());
+    $serv = new Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
     $serv->set([
         "worker_num" => 1,
         'log_file' => '/dev/null'

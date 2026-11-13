@@ -2,23 +2,24 @@
 
 #include <functional>
 
-#include "tests.h"
+#include "test_core.h"
+#include "swoole_process_pool.h"
 
 using namespace std;
 
 namespace swoole { namespace test {
 //-------------------------------------------------------------------------------
-class process
+class Process
 {
 
 private:
-    std::function<void (process*)> handler;
+    std::function<void (Process*)> handler;
 
 public:
-    swWorker worker = {};
+    Worker worker = {};
 
-    process(std::function<void (process*)> fn, int pipe_type = SOCK_DGRAM);
-    ~process();
+    Process(std::function<void (Process*)> fn, int pipe_type = SOCK_DGRAM);
+    ~Process();
     pid_t start();
     ssize_t write(const void *__buf, size_t __n);
     ssize_t read(void *__buf, size_t __nbytes);

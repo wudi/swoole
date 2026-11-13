@@ -10,93 +10,56 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
+#include "swoole_timer.h"
+#include "swoole_signal.h"
 
-static int swSystemTimer_signal_set(swTimer *timer, long interval);
-static int swSystemTimer_set(swTimer *timer, long new_interval);
-static void swSystemTimer_close(swTimer *timer);
+#include <csignal>
+#ifndef _WIN32
+#include <sys/time.h>
+#endif
 
-/**
- * create timer
- */
-int swSystemTimer_init(swTimer *timer, long interval)
-{
-    timer->set = swSystemTimer_set;
-    timer->close = swSystemTimer_close;
-    timer->lasttime = interval;
-    if (swSystemTimer_signal_set(timer, interval) < 0)
-    {
-        return SW_ERR;
-    }
-    swSignal_add(SIGALRM, swSystemTimer_signal_handler);
-    return SW_OK;
+namespace swoole {
+static int SystemTimer_set(Timer *timer, long next_msec);
+
+void Timer::init_with_system_timer() {
+#ifndef _WIN32
+    set = SystemTimer_set;
+    close = [](Timer *timer) { SystemTimer_set(timer, -1); };
+    swoole_signal_set(SIGALRM, [](int sig) { SwooleG.signal_alarm = true; });
+#endif
 }
 
-/**
- * setitimer
- */
-static int swSystemTimer_signal_set(swTimer *timer, long interval)
-{
-    struct itimerval timer_set = {};
-    int sec = interval / 1000;
-    int msec = interval % 1000;
-
-    struct timeval now;
-    if (gettimeofday(&now, nullptr) < 0)
-    {
-        swSysWarn("gettimeofday() failed");
-        return SW_ERR;
+static int SystemTimer_set(Timer *timer, long next_msec) {
+#ifndef _WIN32
+    itimerval timer_set{};
+    if (next_msec > 0) {
+        timer_set.it_interval = {next_msec / 1000, static_cast<int>((next_msec % 1000) * 1000)};
+        timer_set.it_value = timer_set.it_interval;
     }
-
-    if (interval > 0)
-    {
-        timer_set.it_interval.tv_sec = sec;
-        timer_set.it_interval.tv_usec = msec * 1000;
-
-        timer_set.it_value.tv_sec = sec;
-        timer_set.it_value.tv_usec = timer_set.it_interval.tv_usec;
-
-        if (timer_set.it_value.tv_usec > 1e6)
-        {
-            timer_set.it_value.tv_usec = timer_set.it_value.tv_usec - 1e6;
-            timer_set.it_value.tv_sec += 1;
-        }
-    }
-
-    if (setitimer(ITIMER_REAL, &timer_set, nullptr) < 0)
-    {
-        swSysWarn("setitimer() failed");
-        return SW_ERR;
-    }
-    return SW_OK;
+    return setitimer(ITIMER_REAL, &timer_set, nullptr) < 0 ? SW_ERR : SW_OK;
+#else
+    return SW_ERR;
+#endif
 }
 
-static void swSystemTimer_close(swTimer *timer)
-{
-    swSystemTimer_signal_set(timer, -1);
+void realtime_get(timespec *time) {
+    auto now = std::chrono::system_clock::now();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
+    time->tv_sec = ns.count() / SW_NUM_BILLION;
+    time->tv_nsec = ns.count() % SW_NUM_BILLION;
 }
 
-static long _next_msec = 0;
-
-static int swSystemTimer_set(swTimer *timer, long exec_msec)
-{
-    if (exec_msec == _next_msec)
-    {
-        return SW_OK;
+void realtime_add(timespec *time, const int64_t add_msec) {
+    time->tv_sec += add_msec / 1000;
+    time->tv_nsec += add_msec % 1000 * SW_NUM_MILLION;
+    if (time->tv_nsec >= SW_NUM_BILLION) {
+        int secs = time->tv_nsec / SW_NUM_BILLION;
+        time->tv_sec += secs;
+        time->tv_nsec -= secs * SW_NUM_BILLION;
     }
-    if (exec_msec == 0)
-    {
-        exec_msec = 1;
-    }
-    _next_msec = exec_msec;
-    return swSystemTimer_signal_set(timer, exec_msec);
 }
-
-void swSystemTimer_signal_handler(int sig)
-{
-    SwooleWG.signal_alarm = 1;
-}
+}  // namespace swoole

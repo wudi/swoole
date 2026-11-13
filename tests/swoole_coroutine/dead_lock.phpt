@@ -1,7 +1,7 @@
 --TEST--
 swoole_coroutine: dead lock
 --SKIPIF--
-<?php require __DIR__ . '/../include/skipif.inc'; ?>
+<?php require __DIR__ . '/../include/skipif.inc'; skip_if_win(); ?>
 --FILE--
 <?php
 require __DIR__ . '/../include/bootstrap.php';
@@ -9,7 +9,7 @@ require __DIR__ . '/../include/bootstrap.php';
 use Swoole\Coroutine;
 use Swoole\Process;
 
-$pm = new ProcessManager;
+$pm = new SwooleTest\ProcessManager;
 $pm->parentFunc = function () use ($pm) {
     for ($n = 3; $n--;) {
         $ret = Process::wait(false);

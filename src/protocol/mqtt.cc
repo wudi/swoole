@@ -12,70 +12,50 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
+ | Author: Xinhua Guo  <guoxinhua@swoole.com>                           |
  +----------------------------------------------------------------------+
  */
 
-#include "mqtt.h"
+#include "swoole_mqtt.h"
+#include "swoole_protocol.h"
 
-void swMqtt_print_package(swMqtt_packet *pkg)
-{
+using swoole::network::Socket;
+
+namespace swoole {
+namespace mqtt {
+
+void print_package(Packet *pkg) {
     printf("type=%d, length=%d\n", pkg->type, pkg->length);
 }
 
-void swMqtt_set_protocol(swProtocol *protocol)
-{
-    protocol->package_length_size = SW_MQTT_MIN_LENGTH;
+void set_protocol(Protocol *protocol) {
+    protocol->package_length_size = SW_MQTT_MAX_LENGTH_SIZE;
     protocol->package_length_offset = 1;
     protocol->package_body_offset = 0;
-    protocol->get_package_length = swMqtt_get_package_length;
+    protocol->get_package_length = get_package_length;
 }
 
-static sw_inline ssize_t swMqtt_get_length(const char *data, uint32_t size, ssize_t *count)
-{
-    uint8_t byte;
-    int mul = 1;
-    ssize_t length = 0;
-
-    *count = 0;
-    do
-    {
-        byte = data[*count + 1];
-        length += (byte & 127) * mul;
-        mul *= 128;
-        (*count)++;
-    } while ((byte & 128) != 0);
-
-    return length;
-}
-
-#if 0
-int swMqtt_unpack(swMqtt_packet *pkg, char *data, uint32_t size)
-{
-    uint8_t byte = data[0];
-    off_t offset;
-
-    pkg->type = (byte & 0xF0) >> 4;
-    pkg->dup = (byte & 0x08) >> 3;
-    pkg->qos = (byte & 0x06) >> 1;
-    pkg->retain = byte & 0x01;
-
-    offset += 1;
-
-    int count = 0;
-    pkg->length = swMqtt_get_length(data, size, &count);
-    offset += count + 1;
-    return 0;
-}
-#endif
-
-ssize_t swMqtt_get_package_length(swProtocol *protocol, swSocket *conn, const char *data, uint32_t size)
-{
-    if (size < SW_MQTT_MIN_LENGTH)
-    {
-        return 0;
+ssize_t get_package_length(const Protocol *protocol, Socket *conn, PacketLength *pl) {
+    uint32_t remaining_length = 0;
+    // Byte zero is the fixed header. Inspect at most four received Remaining Length bytes.
+    for (uint32_t index = 0; index < SW_MQTT_MAX_LENGTH_SIZE; index++) {
+        const uint32_t offset = index + 1;
+        if (offset >= pl->buf_size) {
+            return 0;
+        }
+        const auto byte = static_cast<uint8_t>(pl->buf[offset]);
+        remaining_length |= static_cast<uint32_t>(byte & 0x7f) << (7 * index);
+        if ((byte & 0x80) == 0) {
+            return remaining_length + offset + 1;
+        }
     }
-    ssize_t count = 0;
-    ssize_t length = swMqtt_get_length(data, size, &count);
-    return length + count + 1;
+    swoole_error_log(SW_LOG_WARNING,
+                     SW_ERROR_PACKAGE_LENGTH_TOO_LARGE,
+                     "bad request, the variable header size is larger than %d",
+                     SW_MQTT_MAX_LENGTH_SIZE);
+    return SW_ERR;
 }
+
+}  // namespace mqtt
+}  // namespace swoole

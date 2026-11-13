@@ -15,8 +15,8 @@ $pm->parentFunc = function () use ($pm) {
         Assert::assert($client->connect('127.0.0.1', $pm->getFreePort()));
         Assert::assert($client->send(Helper::encodePublish([
             'cmd' => 3,
-            'topic' => "swoole/mqtt/test",
-            'content' => '{"name":"swoole", "time":111, "type":"mqtt", "code":200, "data":'. str_repeat("swoole", 100) .'}']))
+            'topic' => 'swoole/mqtt/test',
+            'content' => '{"name":"swoole", "type":"mqtt", "data":'. str_repeat("swoole", 100) .'}']))
         );
         echo $client->recv();
         $client->close();
@@ -30,10 +30,15 @@ $pm->childFunc = function () use ($pm) {
         'open_mqtt_protocol' => 1,
     ]);
 
+    $server->on('WorkerStart', function ($server, $workerId) use ($pm) {
+        if ($workerId === 0) {
+            $pm->wakeup();
+        }
+    });
     $server->on('receive', function (Swoole\Server $serv, int $fd, int $rid, string $data) {
         $header = Helper::getHeader($data);
         Assert::eq($header['type'], 3);
-        Assert::eq(strlen($data), 686);
+        Assert::eq(strlen($data), 662);
         $serv->send($fd, strlen($data));
     });
 
@@ -43,4 +48,4 @@ $pm->childFirst();
 $pm->run();
 ?>
 --EXPECT--
-686
+662

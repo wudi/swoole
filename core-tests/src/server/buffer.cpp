@@ -1,48 +1,60 @@
-#include "test_server.h"
-#include "wrapper/client.hpp"
+/*
+  +----------------------------------------------------------------------+
+  | Swoole                                                               |
+  +----------------------------------------------------------------------+
+  | This source file is subject to version 2.0 of the Apache license,    |
+  | that is bundled with this package in the file LICENSE, and is        |
+  | available through the world-wide-web at the following url:           |
+  | http://www.apache.org/licenses/LICENSE-2.0.html                      |
+  | If you did not receive a copy of the Apache2.0 license and are unable|
+  | to obtain it through the world-wide-web, please send a note to       |
+  | license@swoole.com so we can mail you a copy immediately.            |
+  +----------------------------------------------------------------------+
+  | @link     https://www.swoole.com/                                    |
+  | @contact  team@swoole.com                                            |
+  | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
+  +----------------------------------------------------------------------+
+*/
+
+#include "test_core.h"
+#include "swoole_server.h"
 
 using namespace std;
+using namespace swoole;
 
 static const char *packet = "hello world\n";
 
-TEST(server, send_buffer)
-{
-    swServer serv;
-    swServer_init(&serv);
+TEST(server, send_buffer) {
+    Server serv(Server::MODE_BASE);
     serv.worker_num = 1;
-    serv.factory_mode = SW_MODE_BASE;
-    swServer_create(&serv);
 
-    swLog_set_level(SW_LOG_WARNING);
+    sw_logger()->set_level(SW_LOG_WARNING);
 
-    swListenPort *port = swServer_add_port(&serv, SW_SOCK_TCP, TEST_HOST, 0);
-    if (!port)
-    {
-        swWarn("listen failed, [error=%d]", swoole_get_last_error());
+    ListenPort *port = serv.add_port(SW_SOCK_TCP, TEST_HOST, 0);
+    if (!port) {
+        swoole_warning("listen failed, [error=%d]", swoole_get_last_error());
         exit(2);
     }
 
-    swLock lock;
-    swMutex_create(&lock, 0);
-    lock.lock(&lock);
-    serv.ptr2 = &lock;
+    ASSERT_EQ(serv.create(), SW_OK);
 
-    std::thread t1([&]()
-    {
-        swSignal_none();
+    mutex lock;
+    lock.lock();
 
-        lock.lock(&lock);
+    std::thread t1([&]() {
+        swoole_signal_block_all();
 
-        swoole::Client c(SW_SOCK_TCP);
+        lock.lock();
+
+        swoole::network::SyncClient c(SW_SOCK_TCP);
         c.connect(TEST_HOST, port->port);
         c.send(packet, strlen(packet));
         char buf[4096];
 
-        while(1)
-        {
+        while (1) {
             ssize_t retval = c.recv(buf, sizeof(buf));
-            if (retval <= 0)
-            {
+            if (retval <= 0) {
                 break;
             }
             usleep(100);
@@ -53,28 +65,19 @@ TEST(server, send_buffer)
         kill(getpid(), SIGTERM);
     });
 
-    serv.onWorkerStart = [](swServer *serv, int worker_id)
-    {
-        swLock *lock = (swLock *) serv->ptr2;
-        lock->unlock(lock);
-    };
+    serv.onWorkerStart = [&lock](Server *serv, Worker *worker) { lock.unlock(); };
 
-    serv.onReceive = [](swServer *serv, swEventData *req) -> int
-    {
-        char *data = nullptr;
-        size_t length = serv->get_packet(serv, req, &data);
-        EXPECT_EQ(string(data, length), string(packet));
+    serv.onReceive = [](Server *serv, RecvData *req) -> int {
+        EXPECT_EQ(string(req->data, req->info.len), string(packet));
 
-        swoole::String resp(swoole::make_string(1024*1024*16));
-        auto str = resp.get();
-        swString_repeat(str, "A", 1, resp.size());
-        serv->send(serv, req->info.fd, str->str, str->length);
-        serv->close(serv, req->info.fd, 0);
+        String resp(1024 * 1024 * 16);
+        resp.repeat("A", 1, resp.capacity());
+        EXPECT_TRUE(serv->send(req->info.fd, resp.value(), resp.get_length()));
+        EXPECT_TRUE(serv->close(req->info.fd, 0));
 
         return SW_OK;
     };
 
-    swServer_start(&serv);
+    serv.start();
     t1.join();
 }
-

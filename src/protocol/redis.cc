@@ -12,15 +12,20 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
-#include "swoole.h"
-#include "redis.h"
+#include "swoole_string.h"
+#include "swoole_socket.h"
+#include "swoole_protocol.h"
+#include "swoole_server.h"
+#include "swoole_redis.h"
 
-typedef struct
-{
+namespace swoole {
+namespace redis {
+
+struct Request {
     uint8_t state;
 
     int n_lines_total;
@@ -30,148 +35,149 @@ typedef struct
     int n_bytes_received;
 
     int offset;
+};
 
-} swRedis_request;
+const char *get_number(const char *p, int *_ret) {
+    char *endptr;
+    p++;
+    int ret = strtol(p, &endptr, 10);
+    if (strncmp(SW_CRLF, endptr, SW_CRLF_LEN) == 0) {
+        p += (endptr - p) + SW_CRLF_LEN;
+        *_ret = ret;
+        return p;
+    } else {
+        return nullptr;
+    }
+}
 
-int swRedis_recv(swProtocol *protocol, swConnection *conn, swString *buffer)
-{
-    char *p, *pe;
+#ifndef _WIN32
+int recv_packet(Protocol *protocol, Connection *conn, String *buffer) {
+    const char *p, *pe;
     int ret;
     char *buf_ptr;
     size_t buf_size;
+    RecvData rdata{};
+    Request *request;
+    network::Socket *socket = conn->socket;
 
-    swRedis_request *request;
-    swSocket *socket = conn->socket;
-
-    if (conn->object == nullptr)
-    {
-        request = (swRedis_request *) sw_malloc(sizeof(swRedis_request));
-        if (!request)
-        {
-            swWarn("malloc(%ld) failed", sizeof(swRedis_request));
+    if (conn->object == nullptr) {
+        request = static_cast<Request *>(sw_malloc(sizeof(Request)));
+        if (!request) {
+            swoole_warning("malloc(%ld) failed", sizeof(Request));
             return SW_ERR;
         }
-        sw_memset_zero(request, sizeof(swRedis_request));
+        sw_memset_zero(request, sizeof(Request));
         conn->object = request;
-    }
-    else
-    {
-        request = (swRedis_request *) conn->object;
+    } else {
+        request = static_cast<Request *>(conn->object);
     }
 
-    _recv_data:
+_recv_data:
     buf_ptr = buffer->str + buffer->length;
     buf_size = buffer->size - buffer->length;
 
-    int n = swSocket_recv(socket, buf_ptr, buf_size, 0);
-    if (n < 0)
-    {
-        switch (swSocket_error(errno))
-        {
+    int n = socket->recv(buf_ptr, buf_size, 0);
+    if (n < 0) {
+        switch (socket->catch_read_error(errno)) {
         case SW_ERROR:
-            swSysWarn("recv from socket#%d failed", conn->fd);
+            swoole_sys_warning("recv from socket#%d failed", conn->fd);
             return SW_OK;
         case SW_CLOSE:
             return SW_ERR;
         default:
             return SW_OK;
         }
-    }
-    else if (n == 0)
-    {
+    } else if (n == 0) {
         return SW_ERR;
-    }
-    else
-    {
+    } else {
         buffer->length += n;
 
-        if (strncmp(buffer->str + buffer->length - SW_CRLF_LEN, SW_CRLF, SW_CRLF_LEN) != 0)
-        {
-            if (buffer->size < protocol->package_max_length)
-            {
-                uint32_t extend_size = swoole_size_align(buffer->size * 2, SwooleG.pagesize);
-                if (extend_size > protocol->package_max_length)
-                {
-                    extend_size = protocol->package_max_length;
-                }
-                if (swString_extend(buffer, extend_size) < 0)
-                {
+        if (buffer->length < SW_CRLF_LEN ||
+            strncmp(buffer->str + buffer->length - SW_CRLF_LEN, SW_CRLF, SW_CRLF_LEN) != 0) {
+            if (buffer->length == buffer->size) {
+                if (buffer->size < protocol->package_max_length) {
+                    size_t extend_size;
+                    if (buffer->size >= protocol->package_max_length / 2) {
+                        extend_size = protocol->package_max_length;
+                    } else {
+                        extend_size = swoole_size_align(buffer->size * 2, swoole_pagesize());
+                        if (extend_size > protocol->package_max_length) {
+                            extend_size = protocol->package_max_length;
+                        }
+                    }
+                    buffer->extend(extend_size);
+                } else {
+                _package_too_big:
+                    swoole_warning("Package is too big. package_length=%zu", buffer->length);
                     return SW_ERR;
                 }
-            }
-            else if (buffer->length == buffer->size)
-            {
-                _package_too_big:
-                swWarn("Package is too big. package_length=%ld", buffer->length);
-                return SW_ERR;
             }
             goto _recv_data;
         }
 
         p = buffer->str;
         pe = p + buffer->length;
+        // The buffer is always parsed from the beginning, so the parser state must start over as well.
+        sw_memset_zero(request, sizeof(Request));
 
-        do
-        {
-            switch(request->state)
-            {
-            case SW_REDIS_RECEIVE_TOTAL_LINE:
-                if (*p == '*' && (p = swRedis_get_number(p, &ret)))
-                {
+        do {
+            switch (request->state) {
+            case STATE_RECEIVE_TOTAL_LINE:
+                if (*p == '*') {
+                    if ((p = get_number(p, &ret)) == nullptr) {
+                        goto _failed;
+                    }
                     request->n_lines_total = ret;
-                    request->state = SW_REDIS_RECEIVE_LENGTH;
+                    request->state = STATE_RECEIVE_LENGTH;
                     break;
                 }
                 /* no break */
 
-            case SW_REDIS_RECEIVE_LENGTH:
-                if (*p == '$' && (p = swRedis_get_number(p, &ret)))
-                {
-                    if (ret < 0)
-                    {
+            case STATE_RECEIVE_LENGTH:
+                if (*p == '$') {
+                    if ((p = get_number(p, &ret)) == nullptr) {
+                        goto _failed;
+                    }
+                    if (ret < 0) {
                         break;
                     }
-                    if (ret + (p - buffer->str) > protocol->package_max_length)
-                    {
+                    if (ret + (p - buffer->str) > protocol->package_max_length) {
                         goto _package_too_big;
                     }
                     request->n_bytes_total = ret;
-                    request->state = SW_REDIS_RECEIVE_STRING;
+                    request->state = STATE_RECEIVE_STRING;
                     break;
                 }
-                //integer
-                else if (*p == ':' && (p = swRedis_get_number(p, &ret)))
-                {
+                // integer
+                else if (*p == ':') {
+                    if ((p = get_number(p, &ret)) == nullptr) {
+                        goto _failed;
+                    }
                     break;
                 }
                 /* no break */
 
-            case SW_REDIS_RECEIVE_STRING:
-                if (pe - p < request->n_bytes_total - request->n_bytes_received)
-                {
-                    request->n_bytes_received += pe - p;
+            case STATE_RECEIVE_STRING:
+                if (pe - p < request->n_bytes_total + SW_CRLF_LEN) {
                     return SW_OK;
-                }
-                else
-                {
+                } else {
                     p += request->n_bytes_total + SW_CRLF_LEN;
                     request->n_bytes_total = 0;
                     request->n_lines_received++;
-                    request->state = SW_REDIS_RECEIVE_LENGTH;
+                    request->state = STATE_RECEIVE_LENGTH;
                     buffer->offset = buffer->length;
 
-                    if (request->n_lines_received == request->n_lines_total)
-                    {
-                        if (protocol->onPackage(protocol, socket, buffer->str, buffer->length) < 0)
-                        {
+                    if (request->n_lines_received == request->n_lines_total) {
+                        rdata.info.len = buffer->length;
+                        rdata.data = buffer->str;
+                        if (protocol->onPackage(protocol, socket, &rdata) < 0) {
                             return SW_ERR;
                         }
-                        if (socket->removed)
-                        {
+                        if (socket->removed) {
                             return SW_OK;
                         }
-                        swString_clear(buffer);
-                        sw_memset_zero(request, sizeof(swRedis_request));
+                        buffer->clear();
+                        sw_memset_zero(request, sizeof(Request));
                         return SW_OK;
                     }
                 }
@@ -180,9 +186,94 @@ int swRedis_recv(swProtocol *protocol, swConnection *conn, swString *buffer)
             default:
                 goto _failed;
             }
-        } while(p < pe);
+        } while (p < pe);
+        // the request is incomplete, wait for more data
+        return SW_OK;
     }
-    _failed:
-    swWarn("redis protocol error");
+_failed:
+    swoole_warning("redis protocol error");
     return SW_ERR;
 }
+#endif  // _WIN32
+
+void format_nil(String *buf) {
+    buf->append(SW_STRL(SW_REDIS_RETURN_NIL));
+}
+
+void format(String *buf, ReplyType type, const std::string &value) {
+    if (type == REPLY_STATUS) {
+        if (value.empty()) {
+            buf->append(SW_STRL("+OK\r\n"));
+        } else {
+            buf->format("+%.*s\r\n", value.length(), value.c_str());
+        }
+    } else if (type == REPLY_ERROR) {
+        if (value.empty()) {
+            buf->append(SW_STRL("-ERR\r\n"));
+        } else {
+            buf->format("-%.*s\r\n", value.length(), value.c_str());
+        }
+    } else if (type == REPLY_STRING) {
+        // Empty bulk strings are valid RESP values and still require their length and CRLF.
+        buf->format("$%zu\r\n", value.length());
+        buf->append(value);
+        buf->append(SW_CRLF, SW_CRLF_LEN);
+    }
+}
+
+void format(String *buf, ReplyType type, long value) {
+    buf->format(":%" PRId64 "\r\n", value);
+}
+
+std::vector<std::string> parse(const char *data, size_t len) {
+    int state = STATE_RECEIVE_TOTAL_LINE;
+
+    const char *p = data;
+    const char *pe = p + len;
+    int ret;
+    int length = 0;
+
+    std::vector<std::string> result;
+    do {
+        switch (state) {
+        case STATE_RECEIVE_TOTAL_LINE:
+            if (*p == '*' && ((p = get_number(p, &ret)))) {
+                state = STATE_RECEIVE_LENGTH;
+                break;
+            }
+            /* no break */
+
+        case STATE_RECEIVE_LENGTH:
+            if (*p == '$' && ((p = get_number(p, &ret)))) {
+                if (ret == -1) {
+                    break;
+                }
+                length = ret;
+                state = STATE_RECEIVE_STRING;
+                break;
+            }
+            // integer
+            else if (*p == ':' && ((p = get_number(p, &ret)))) {
+                result.push_back(std::to_string(ret));
+                break;
+            }
+            /* no break */
+
+        case STATE_RECEIVE_STRING:
+            if (static_cast<size_t>(pe - p) < static_cast<size_t>(length + SW_CRLF_LEN)) {
+                return result;
+            }
+            result.emplace_back(p, length);
+            p += length + SW_CRLF_LEN;
+            state = STATE_RECEIVE_LENGTH;
+            break;
+
+        default:
+            break;
+        }
+    } while (p < pe);
+
+    return result;
+}
+}  // namespace redis
+}  // namespace swoole

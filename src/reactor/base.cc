@@ -10,20 +10,20 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole_cxx.h"
-#include "async.h"
+#include "swoole_socket.h"
+#include "swoole_signal.h"
+#include "swoole_reactor.h"
+#include "swoole_timer.h"
+#include "swoole_util.h"
 
-#include "coroutine_c_api.h"
-#include "coroutine_socket.h"
-#include "coroutine_system.h"
+#include "swoole_api.h"
 
-using swoole::CallbackManager;
-using swoole::coroutine::Socket;
-using swoole::coroutine::System;
+namespace swoole {
+using network::Socket;
 
 #ifdef SW_USE_MALLOC_TRIM
 #ifdef __APPLE__
@@ -33,415 +33,473 @@ using swoole::coroutine::System;
 #endif
 #endif
 
-static void reactor_timeout(swReactor *reactor);
-static void reactor_finish(swReactor *reactor);
-static void reactor_begin(swReactor *reactor);
-static void defer_task_do(swReactor *reactor);
-static void defer_task_add(swReactor *reactor, swCallback callback, void *data);
-
-int swReactor_create(swReactor *reactor, int max_event)
-{
-    int ret;
-    sw_memset_zero(reactor, sizeof(swReactor));
-
 #ifdef HAVE_EPOLL
-    ret = swReactorEpoll_create(reactor, max_event);
-#elif defined(HAVE_KQUEUE)
-    ret = swReactorKqueue_create(reactor, max_event);
-#elif defined(HAVE_POLL)
-    ret = swReactorPoll_create(reactor, max_event);
+ReactorImpl *make_reactor_epoll(Reactor *_reactor, int max_events);
+#endif
+
+#ifdef HAVE_KQUEUE
+ReactorImpl *make_reactor_kqueue(Reactor *_reactor, int max_events);
+#endif
+
+#ifdef _WIN32
+ReactorImpl *make_reactor_iocp(Reactor *_reactor, int max_events);
 #else
-    ret = swReactorSelect_create(reactor);
+ReactorImpl *make_reactor_poll(Reactor *_reactor, int max_events);
 #endif
 
-    reactor->running = 1;
-
-    reactor->onFinish = reactor_finish;
-    reactor->onTimeout = reactor_timeout;
-    reactor->is_empty = swReactor_empty;
-    reactor->can_exit = SwooleG.reactor_can_exit;
-
-    reactor->write = swReactor_write;
-    reactor->close = swReactor_close;
-
-    reactor->defer = defer_task_add;
-    reactor->defer_tasks = nullptr;
-
-    reactor->default_write_handler = swReactor_onWrite;
-
-    Socket::init_reactor(reactor);
-    System::init_reactor(reactor);
-    swClient_init_reactor(reactor);
-
-    if (SwooleG.hooks[SW_GLOBAL_HOOK_ON_REACTOR_CREATE])
-    {
-        swoole_call_hook(SW_GLOBAL_HOOK_ON_REACTOR_CREATE, reactor);
-    }
-
-    return ret;
-}
-
-int swReactor_set_handler(swReactor *reactor, int _fdtype, swReactor_handler handle)
-{
-    int fdtype = swReactor_fdtype(_fdtype);
-
-    if (fdtype >= SW_MAX_FDTYPE)
-    {
-        swWarn("fdtype > SW_MAX_FDTYPE[%d]", SW_MAX_FDTYPE);
-        return SW_ERR;
-    }
-
-    if (swReactor_event_read(_fdtype))
-    {
-        reactor->read_handler[fdtype] = handle;
-    }
-    else if (swReactor_event_write(_fdtype))
-    {
-        reactor->write_handler[fdtype] = handle;
-    }
-    else if (swReactor_event_error(_fdtype))
-    {
-        reactor->error_handler[fdtype] = handle;
-    }
-    else
-    {
-        swWarn("unknow fdtype");
-        return SW_ERR;
-    }
-
-    return SW_OK;
-}
-
-int swReactor_empty(swReactor *reactor)
-{
-    if (reactor->timer && reactor->timer->num > 0)
-    {
-        return SW_FALSE;
-    }
-    if (reactor->defer_tasks)
-    {
-        return SW_FALSE;
-    }
-    if (swoole_coroutine_wait_count() > 0)
-    {
-        return SW_FALSE;
-    }
-    if (SwooleTG.reactor->co_signal_listener_num > 0)
-    {
-        return SW_FALSE;
-    }
-    if (SwooleTG.reactor->signal_listener_num > 0 && SwooleG.wait_signal)
-    {
-        return SW_FALSE;
-    }
-
-    int event_num = reactor->event_num;
-    int empty = SW_FALSE;
-    //aio thread pool
-    if (SwooleTG.aio_init && SwooleTG.aio_task_num == 0)
-    {
-        event_num--;
-    }
-    //signalfd
-    if (swReactor_isset_handler(reactor, SW_FD_SIGNAL))
-    {
-        event_num--;
-    }
-    //no event
-    if (event_num == 0)
-    {
-        empty = SW_TRUE;
-    }
-    //custom
-    if (reactor->can_exit && !reactor->can_exit(reactor))
-    {
-        empty = SW_FALSE;
-    }
-    return empty;
-}
-
-/**
- * execute when reactor timeout and reactor finish
- */
-static void reactor_finish(swReactor *reactor)
-{
-    //check timer
-    if (reactor->check_timer)
-    {
-        swTimer_select(reactor->timer);
-    }
-    //defer tasks
-    if (reactor->defer_tasks)
-    {
-        defer_task_do(reactor);
-    }
-    //callback at the end
-    if (reactor->idle_task.callback)
-    {
-        reactor->idle_task.callback(reactor->idle_task.data);
-    }
-    //check signal
-    if (sw_unlikely(reactor->singal_no))
-    {
-        swSignal_callback(reactor->singal_no);
-        reactor->singal_no = 0;
-    }
-    //the event loop is empty
-    if (reactor->wait_exit && reactor->is_empty(reactor))
-    {
-        reactor->running = 0;
-    }
-#ifdef SW_USE_MALLOC_TRIM
-    time_t now = time(nullptr);
-    if (reactor->last_malloc_trim_time < now - SW_MALLOC_TRIM_INTERVAL)
-    {
-        malloc_trim(SW_MALLOC_TRIM_PAD);
-        reactor->last_malloc_trim_time = now;
-    }
-#endif
-}
-
-static void reactor_timeout(swReactor *reactor)
-{
-    reactor_finish(reactor);
-}
-
-void swReactor_activate_future_task(swReactor *reactor)
-{
-    reactor->onBegin = reactor_begin;
-}
-
-static void reactor_begin(swReactor *reactor)
-{
-    if (reactor->future_task.callback)
-    {
-        reactor->future_task.callback(reactor->future_task.data);
+void ReactorImpl::after_removal_failure(const Socket *_socket) const {
+    if (!_socket->silent_remove) {
+        swoole_error_log(SW_LOG_WARNING,
+                         SW_ERROR_EVENT_REMOVE_FAILED,
+                         "failed to delete events[fd=%d#%d, type=%d, events=%d, errno=%d]",
+                         _socket->fd,
+                         reactor_->id,
+                         _socket->fd_type,
+                         _socket->events,
+                         errno);
+        swoole_print_backtrace_on_error();
     }
 }
 
-int swReactor_close(swReactor *reactor, swSocket *socket)
-{
-    if (socket->out_buffer)
-    {
-        swBuffer_free(socket->out_buffer);
-        socket->out_buffer = nullptr;
-    }
-    if (socket->in_buffer)
-    {
-        swBuffer_free(socket->in_buffer);
-        socket->in_buffer = nullptr;
-    }
-
-    swTraceLog(SW_TRACE_CLOSE, "fd=%d", socket->fd);
-
-    swSocket_free(socket);
-
-    return SW_OK;
-}
-
-int swReactor_write(swReactor *reactor, swSocket *socket, const void *buf, int n)
-{
-    int ret;
-    swBuffer *buffer = socket->out_buffer;
-    const char *ptr = (const char *) buf;
-    int fd = socket->fd;
-
-    if (socket->buffer_size == 0)
-    {
-        socket->buffer_size = SwooleG.socket_buffer_size;
-    }
-
-    if (socket->nonblock == 0)
-    {
-        swoole_fcntl_set_option(socket->fd, 1, -1);
-        socket->nonblock = 1;
-    }
-
-    if ((uint32_t) n > socket->buffer_size)
-    {
-        swoole_error_log(SW_LOG_WARNING, SW_ERROR_PACKAGE_LENGTH_TOO_LARGE, "data is too large, cannot exceed buffer size");
-        return SW_ERR;
-    }
-
-    if (swBuffer_empty(buffer))
-    {
-#ifdef SW_USE_OPENSSL
-        if (socket->ssl_send)
-        {
-            goto _do_buffer;
+Reactor::Reactor(int max_event, Type _type) {
+    if (_type == TYPE_AUTO) {
+#ifdef _WIN32
+        type_ = TYPE_IOCP;
+#elif defined(HAVE_EPOLL)
+        type_ = TYPE_EPOLL;
+#else
+        type_ = TYPE_POLL;
+#ifdef HAVE_KQUEUE
+        /**
+         * When kqueue is enabled, the Process mode of the Server module and functionalities such as Task operations,
+         * pipe messaging, and inter-process message forwarding that rely on pipe communication will be unavailable.
+         */
+        if (SwooleG.enable_kqueue) {
+            type_ = TYPE_KQUEUE;
         }
 #endif
-        _do_send:
-        ret = swSocket_send(socket, ptr, n, 0);
+#endif
+    } else {
+        type_ = _type;
+    }
 
-        if (ret > 0)
-        {
-            if (n == ret)
-            {
-                return ret;
-            }
-            else
-            {
-                ptr += ret;
-                n -= ret;
-                goto _do_buffer;
-            }
-        }
-        else if (swSocket_error(errno) == SW_WAIT)
-        {
-            _do_buffer:
-            if (!socket->out_buffer)
-            {
-                buffer = swBuffer_new(socket->chunk_size);
-                if (!buffer)
-                {
-                    swWarn("create worker buffer failed");
-                    return SW_ERR;
+    switch (type_) {
+#ifdef _WIN32
+    case TYPE_IOCP:
+        impl.reset(make_reactor_iocp(this, max_event));
+        break;
+#endif
+#ifdef HAVE_EPOLL
+    case TYPE_EPOLL:
+        impl.reset(make_reactor_epoll(this, max_event));
+        break;
+#endif
+#ifdef HAVE_KQUEUE
+    case TYPE_KQUEUE:
+        impl.reset(make_reactor_kqueue(this, max_event));
+        break;
+#endif
+#ifdef _WIN32
+    default:
+        impl.reset(make_reactor_iocp(this, max_event));
+        break;
+#else
+    default:
+        impl.reset(make_reactor_poll(this, max_event));
+        break;
+#endif
+    }
+
+    ready_ = impl->ready();
+    if (!ready_) {
+        return;
+    }
+
+    timeout_msec = -1;
+    idle_task = {};
+    future_task = {};
+
+    write = _write;
+    writev = _writev;
+    close = _close;
+
+    default_write_handler = _writable_callback;
+
+    if (swoole_isset_hook(SW_GLOBAL_HOOK_ON_REACTOR_CREATE)) {
+        swoole_call_hook(SW_GLOBAL_HOOK_ON_REACTOR_CREATE, this);
+    }
+
+    set_end_callback(PRIORITY_DEFER_TASK, [](Reactor *reactor) {
+        std::unique_ptr<CallbackManager> cm(std::exchange(reactor->defer_tasks, nullptr));
+        if (cm) {
+            ON_SCOPE_EXIT {
+                if (!cm->empty()) {
+                    if (reactor->defer_tasks) {
+                        reactor->defer_tasks->prepend(*cm);
+                    } else {
+                        reactor->defer_tasks = cm.release();
+                    }
                 }
+            };
+            cm->execute();
+        }
+    });
+
+    set_exit_condition(EXIT_CONDITION_DEFER_TASK,
+                       [](Reactor *reactor, size_t &event_num) -> bool { return reactor->defer_tasks == nullptr; });
+
+    set_end_callback(PRIORITY_IDLE_TASK, [](Reactor *reactor) {
+        if (reactor->idle_task.callback) {
+            reactor->idle_task.callback(reactor->idle_task.data);
+        }
+    });
+
+#ifndef _WIN32
+    if (swoole_is_main_thread()) {
+        set_end_callback(PRIORITY_SIGNAL_CALLBACK, [](Reactor *) { swoole_signal_dispatch(); });
+    }
+#endif
+
+    set_end_callback(PRIORITY_TRY_EXIT, [](Reactor *reactor) {
+        if (reactor->wait_exit && reactor->if_exit()) {
+            reactor->running = false;
+        }
+    });
+
+#ifdef SW_USE_MALLOC_TRIM
+    if (swoole_is_main_thread()) {
+        set_end_callback(PRIORITY_MALLOC_TRIM, [](Reactor *reactor) {
+            time_t now = ::time(nullptr);
+            if (reactor->last_malloc_trim_time < now - SW_MALLOC_TRIM_INTERVAL) {
+                malloc_trim(SW_MALLOC_TRIM_PAD);
+                reactor->last_malloc_trim_time = now;
+            }
+        });
+    }
+#endif
+
+    set_exit_condition(EXIT_CONDITION_DEFAULT, [](Reactor *, size_t &event_num) -> bool { return event_num == 0; });
+}
+
+void Reactor::set_handler(const int fd_type, const int event, const ReactorHandler handler) {
+    if (isset_read_event(event)) {
+        read_handler[fd_type] = handler;
+    } else if (isset_write_event(event)) {
+        write_handler[fd_type] = handler;
+    } else if (isset_error_event(event)) {
+        error_handler[fd_type] = handler;
+    } else {
+        // Reactor users are expected to pass exactly one event class here.
+        // Invalid values are treated as a programmer error and kept under assert.
+        assert(0);
+    }
+}
+
+bool Reactor::isset_handler(const int fd_type, const int event) const {
+    if (isset_read_event(event)) {
+        return read_handler[fd_type] != nullptr;
+    } else if (isset_write_event(event)) {
+        return write_handler[fd_type] != nullptr;
+    } else if (isset_error_event(event)) {
+        return error_handler[fd_type] != nullptr;
+    } else {
+        return false;
+    }
+}
+
+bool Reactor::if_exit() {
+    size_t _event_num = get_event_num();
+    for (auto &kv : exit_conditions) {
+        if (kv.second(this, _event_num) == false) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int16_t translate_events_to_poll(int events) {
+    int16_t poll_events = 0;
+
+    if (events & SW_EVENT_READ) {
+        poll_events |= POLLIN;
+    }
+    if (events & SW_EVENT_WRITE) {
+        poll_events |= POLLOUT;
+    }
+
+    return poll_events;
+}
+
+int translate_events_from_poll(int16_t events) {
+    int sw_events = 0;
+
+    if (events & POLLIN) {
+        sw_events |= SW_EVENT_READ;
+    }
+    if (events & POLLOUT) {
+        sw_events |= SW_EVENT_WRITE;
+    }
+    // ignore ERR and HUP, because event is already processed at IN and OUT handler.
+    if ((events & POLLERR || events & POLLHUP) && !(events & POLLIN || events & POLLOUT)) {
+        sw_events |= SW_EVENT_ERROR;
+    }
+
+    return sw_events;
+}
+
+int Reactor::_close(Reactor *reactor, Socket *socket) {
+    swoole_trace_log(SW_TRACE_CLOSE, "fd=%d", socket->fd);
+    socket->free();
+    return SW_OK;
+}
+
+ssize_t Reactor::write_func(const Reactor *reactor,
+                            Socket *socket,
+                            const size_t _len,
+                            const std::function<ssize_t()> &send_fn,
+                            const std::function<void(Buffer *buffer)> &append_fn) {
+    Buffer *buffer = socket->out_buffer;
+
+    if (socket->buffer_size == 0) {
+        socket->set_memory_buffer_size(Socket::default_buffer_size);
+    }
+
+    if (socket->nonblock == 0) {
+        socket->set_fd_option(1, -1);
+    }
+
+    if ((uint32_t) _len > socket->buffer_size) {
+        swoole_error_log(SW_LOG_WARNING,
+                         SW_ERROR_PACKAGE_LENGTH_TOO_LARGE,
+                         "data packet is too large, cannot exceed the socket buffer size");
+        return SW_ERR;
+    }
+
+    if (Buffer::empty(buffer)) {
+        ssize_t retval;
+        if (socket->ssl_send_) {
+            goto _alloc_buffer;
+        }
+    _do_send:
+        retval = send_fn();
+
+        if (retval > 0) {
+            if ((ssize_t) _len == retval) {
+                return retval;
+            } else {
+                goto _alloc_buffer;
+            }
+        } else if (socket->catch_write_error(errno) == SW_WAIT) {
+        _alloc_buffer:
+            if (!socket->out_buffer) {
+                buffer = new Buffer(socket->chunk_size);
                 socket->out_buffer = buffer;
             }
-
-            swReactor_add_write_event(reactor, socket);
+            if (!socket->isset_writable_event()) {
+                reactor->add_write_event(socket);
+            }
+            /**
+             * Part of the data has been successfully written to the kernel's socket buffer,
+             * and at this point, writing to the memory queue is permitted under any circumstances.
+             * Ensure that the async write operation either succeeds completely or fails entirely.
+             */
             goto _append_buffer;
-        }
-        else if (errno == EINTR)
-        {
+        } else if (errno == EINTR) {
             goto _do_send;
-        }
-        else
-        {
+        } else {
             swoole_set_last_error(errno);
             return SW_ERR;
         }
-    }
-    else
-    {
-        _append_buffer:
-        if (buffer->length > socket->buffer_size)
-        {
-            if (socket->dontwait)
-            {
-                swoole_set_last_error(SW_ERROR_OUTPUT_BUFFER_OVERFLOW);
-                return SW_ERR;
-            }
-            else
-            {
-                swoole_error_log(SW_LOG_WARNING, SW_ERROR_OUTPUT_BUFFER_OVERFLOW, "socket#%d output buffer overflow", fd);
-                swYield();
-                swSocket_wait(socket->fd, SW_SOCKET_OVERFLOW_WAIT, SW_EVENT_WRITE);
-            }
-        }
-
-        if (swBuffer_append(buffer, ptr, n) < 0)
-        {
+    } else {
+        if (buffer->length() + _len > socket->buffer_size) {
+            swoole_error_log(SW_LOG_WARNING,
+                             SW_ERROR_OUTPUT_BUFFER_OVERFLOW,
+                             "socket#%d output buffer overflow: (%u/%u)",
+                             socket->get_fd(),
+                             buffer->length(),
+                             socket->buffer_size);
             return SW_ERR;
         }
+    _append_buffer:
+        append_fn(buffer);
     }
-    return SW_OK;
+    return _len;
 }
 
-int swReactor_onWrite(swReactor *reactor, swEvent *ev)
-{
+ssize_t Reactor::_write(Reactor *reactor, Socket *socket, const void *buf, size_t n) {
+    ssize_t send_bytes = 0;
+    auto send_fn = [&send_bytes, socket, buf, n]() -> ssize_t {
+        send_bytes = socket->send(buf, n, 0);
+        return send_bytes;
+    };
+    auto append_fn = [&send_bytes, buf, n](Buffer *buffer) {
+        ssize_t offset = send_bytes > 0 ? send_bytes : 0;
+        buffer->append(static_cast<const char *>(buf) + offset, n - offset);
+    };
+    return write_func(reactor, socket, n, send_fn, append_fn);
+}
+
+ssize_t Reactor::_writev(Reactor *reactor, Socket *socket, const iovec *iov, size_t iovcnt) {
+    if (socket->ssl) {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_OPERATION_NOT_SUPPORT, "does not support SSL");
+        return SW_ERR;
+    }
+
+    ssize_t send_bytes = 0;
+    size_t n = 0;
+    SW_LOOP_N(iovcnt) {
+        n += iov[i].iov_len;
+    }
+    auto send_fn = [&send_bytes, socket, iov, iovcnt]() -> ssize_t {
+        send_bytes = socket->writev(iov, iovcnt);
+        return send_bytes;
+    };
+    auto append_fn = [&send_bytes, iov, iovcnt](Buffer *buffer) {
+        ssize_t offset = send_bytes > 0 ? send_bytes : 0;
+        buffer->append(iov, iovcnt, offset);
+    };
+    return write_func(reactor, socket, n, send_fn, append_fn);
+}
+
+int Reactor::_writable_callback(Reactor *reactor, Event *ev) {
     int ret;
 
-    swSocket *socket = ev->socket;
-    swBuffer_chunk *chunk = nullptr;
-    swBuffer *buffer = socket->out_buffer;
+    Socket *socket = ev->socket;
+    Buffer *buffer = socket->out_buffer;
 
-    //send to socket
-    while (!swBuffer_empty(buffer))
-    {
-        chunk = swBuffer_get_chunk(buffer);
-        if (chunk->type == SW_CHUNK_CLOSE)
-        {
-            _close_fd:
-            reactor->close(reactor, ev->socket);
-            return SW_OK;
-        }
-        else if (chunk->type == SW_CHUNK_SENDFILE)
-        {
-            ret = swSocket_onSendfile(socket, chunk);
-        }
-        else
-        {
-            ret = swSocket_buffer_send(socket);
+    while (!Buffer::empty(buffer)) {
+        BufferChunk *chunk = buffer->front();
+        if (chunk->type == BufferChunk::TYPE_CLOSE) {
+            return reactor->close(reactor, ev->socket);
+        } else if (chunk->type == BufferChunk::TYPE_SENDFILE) {
+            ret = socket->handle_sendfile();
+        } else {
+            ret = socket->handle_send();
         }
 
-        if (ret < 0)
-        {
-            if (socket->close_wait)
-            {
-                goto _close_fd;
-            }
-            else if (socket->send_wait)
-            {
+        if (ret < 0) {
+            if (socket->close_wait) {
+                return reactor->trigger_close_event(ev);
+            } else if (socket->send_wait) {
                 return SW_OK;
             }
         }
     }
 
-    //remove EPOLLOUT event
-    if (swBuffer_empty(buffer))
-    {
-        swReactor_remove_write_event(reactor, ev->socket);
+    if (socket->send_timer) {
+        swoole_timer_del(socket->send_timer);
+        socket->send_timer = nullptr;
+    }
+
+    // remove EPOLLOUT event
+    if (Buffer::empty(buffer)) {
+        reactor->remove_write_event(ev->socket);
     }
 
     return SW_OK;
 }
 
-int swReactor_wait_write_buffer(swReactor *reactor, swSocket *socket)
-{
-    swEvent event = {};
+void Reactor::drain_write_buffer(Socket *socket, int timeout_msec) {
+    Event event = {};
+    event.socket = socket;
+    event.fd = socket->fd;
 
-    if (!swBuffer_empty(socket->out_buffer))
-    {
-        swSocket_set_block(socket);
-        event.socket = socket;
-        event.fd = socket->fd;
-        return swReactor_onWrite(reactor, &event);
+    int64_t deadline = time<std::chrono::milliseconds>(true) + timeout_msec;
+    while (!Buffer::empty(socket->out_buffer)) {
+        int wait_msec = static_cast<int>(sec2msec(Socket::default_write_timeout));
+        if (timeout_msec >= 0) {
+            int64_t remaining = deadline - time<std::chrono::milliseconds>(true);
+            if (remaining <= 0) {
+                break;
+            }
+            wait_msec = static_cast<int>(remaining);
+        }
+        if (socket->wait_event(wait_msec, SW_EVENT_WRITE) == SW_ERR) {
+            break;
+        }
+        _writable_callback(this, &event);
+        if (socket->close_wait || socket->removed) {
+            break;
+        }
     }
-    
-    return SW_OK;
 }
 
-void swReactor_add_destroy_callback(swReactor *reactor, swCallback cb, void *data)
-{
-    CallbackManager *cm = (CallbackManager *) reactor->destroy_callbacks;
-    if (cm == nullptr)
-    {
-        cm = new CallbackManager;
-        reactor->destroy_callbacks = cm;
+void Reactor::add_destroy_callback(const Callback &cb, void *data) {
+    destroy_callbacks.append(cb, data);
+}
+
+void Reactor::set_end_callback(const EndCallback _id, const std::function<void(Reactor *)> &fn) {
+    end_callbacks[_id] = fn;
+}
+
+void Reactor::erase_end_callback(const EndCallback _id) {
+    end_callbacks.erase(_id);
+}
+
+/**
+ * Returns false, the reactor cannot be exited, the next condition is skipped
+ * Returns true, the reactor can exit and will continue to execute the next conditional function
+ */
+void Reactor::set_exit_condition(const ExitCondition _id, const std::function<bool(Reactor *, size_t &)> &fn) {
+    exit_conditions[_id] = fn;
+}
+
+void Reactor::defer(const Callback &cb, void *data) {
+    defer(cb, data, nullptr);
+}
+
+void Reactor::defer(const Callback &cb, void *data, CallbackManager::Cleanup discard) {
+    if (defer_tasks == nullptr) {
+        auto tasks = std::make_unique<CallbackManager>();
+        tasks->append(cb, data, discard);
+        defer_tasks = tasks.release();
+    } else {
+        defer_tasks->append(cb, data, discard);
     }
-    cm->append(cb, data);
 }
 
-static void defer_task_do(swReactor *reactor)
-{
-    CallbackManager *cm = (CallbackManager *) reactor->defer_tasks;
-    reactor->defer_tasks = nullptr;
-    cm->execute();
-    delete cm;
-}
-
-static void defer_task_add(swReactor *reactor, swCallback callback, void *data)
-{
-    CallbackManager *cm = (CallbackManager *) reactor->defer_tasks;
-    if (cm == nullptr)
-    {
-        cm = new CallbackManager;
-        reactor->defer_tasks = cm;
+int Reactor::wait() const {
+    if (sw_unlikely(waiting_)) {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_WRONG_OPERATION, "event loop is already running");
+        errno = EBUSY;
+        return SW_ERR;
     }
-    cm->append(callback, data);
+    waiting_ = true;
+    ON_SCOPE_EXIT {
+        waiting_ = false;
+    };
+    return impl->wait();
 }
 
-void swReactor_destroy(swReactor *reactor)
-{
-    if (reactor->destroy_callbacks)
-    {
-        CallbackManager *cm = (CallbackManager *) reactor->destroy_callbacks;
-        cm->execute();
-        reactor->destroy_callbacks = nullptr;
-        delete cm;
+void Reactor::execute_end_callbacks(bool _timed_out) {
+    timed_out = _timed_out;
+    for (auto &kv : end_callbacks) {
+        kv.second(this);
     }
-    reactor->free(reactor);
+    round_++;
 }
+
+void Reactor::execute_begin_callback() const {
+    if (future_task.callback) {
+        future_task.callback(future_task.data);
+    }
+}
+
+void Reactor::discard_defer_tasks() {
+    while (defer_tasks) {
+        std::unique_ptr<CallbackManager> tasks(std::exchange(defer_tasks, nullptr));
+    }
+}
+
+Reactor::~Reactor() {
+    destroying_ = true;
+    destroyed = true;
+    destroy_callbacks.execute();
+    discard_defer_tasks();
+    impl.reset();
+    if (swoole_isset_hook(SW_GLOBAL_HOOK_ON_REACTOR_DESTROY)) {
+        swoole_call_hook(SW_GLOBAL_HOOK_ON_REACTOR_DESTROY, this);
+    }
+    discard_defer_tasks();
+}
+}  // namespace swoole

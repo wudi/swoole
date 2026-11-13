@@ -10,91 +10,131 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
+#include "swoole_lock.h"
 
-static int swMutex_lock(swLock *lock);
-static int swMutex_unlock(swLock *lock);
-static int swMutex_trylock(swLock *lock);
-static int swMutex_free(swLock *lock);
+namespace swoole {
 
-int swMutex_create(swLock *lock, int use_in_process)
-{
-    int ret;
-    sw_memset_zero(lock, sizeof(swLock));
-    lock->type = SW_MUTEX;
-    pthread_mutexattr_init(&lock->object.mutex.attr);
-    if (use_in_process == 1)
-    {
-        pthread_mutexattr_setpshared(&lock->object.mutex.attr, PTHREAD_PROCESS_SHARED);
+#ifdef _WIN32
+struct MutexImpl {
+    SRWLOCK lock_;
+    bool exclusive_;
+};
+
+Mutex::Mutex(bool shared) : Lock(MUTEX, shared) {
+    if (shared) {
+        impl = (MutexImpl *) sw_mem_pool()->alloc(sizeof(*impl));
+        if (impl == nullptr) {
+            throw std::bad_alloc();
+        }
+    } else {
+        impl = new MutexImpl();
     }
-    if ((ret = pthread_mutex_init(&lock->object.mutex._lock, &lock->object.mutex.attr)) < 0)
-    {
-        return SW_ERR;
-    }
-    lock->lock = swMutex_lock;
-    lock->unlock = swMutex_unlock;
-    lock->trylock = swMutex_trylock;
-    lock->free = swMutex_free;
-    return SW_OK;
+    InitializeSRWLock(&impl->lock_);
+    impl->exclusive_ = false;
 }
 
-static int swMutex_lock(swLock *lock)
-{
-    return pthread_mutex_lock(&lock->object.mutex._lock);
-}
-
-static int swMutex_unlock(swLock *lock)
-{
-    return pthread_mutex_unlock(&lock->object.mutex._lock);
-}
-
-static int swMutex_trylock(swLock *lock)
-{
-    return pthread_mutex_trylock(&lock->object.mutex._lock);
-}
-
-#ifdef HAVE_MUTEX_TIMEDLOCK
-int swMutex_lockwait(swLock *lock, int timeout_msec)
-{
-    struct timespec timeo;
-    timeo.tv_sec = timeout_msec / 1000;
-    timeo.tv_nsec = (timeout_msec - timeo.tv_sec * 1000) * 1000 * 1000;
-    return pthread_mutex_timedlock(&lock->object.mutex._lock, &timeo);
-}
-#else
-int swMutex_lockwait(swLock *lock, int timeout_msec)
-{
-    int sub = 1;
-    int sleep_ms = 1000;
-
-    if (timeout_msec > 100)
-    {
-        sub = 10;
-        sleep_ms = 10000;
-    }
-
-    while( timeout_msec > 0)
-    {
-        if (pthread_mutex_trylock(&lock->object.mutex._lock) == 0)
-        {
+int Mutex::lock(int operation, int timeout_msec) {
+    if (operation & LOCK_NB) {
+        // TryAcquireSRWLockExclusive returns TRUE if acquired
+        if (TryAcquireSRWLockExclusive(&impl->lock_)) {
+            impl->exclusive_ = true;
             return 0;
         }
-        else
-        {
-            usleep(sleep_ms);
-            timeout_msec -= sub;
+        return EBUSY;
+    }
+    if (timeout_msec > 0) {
+        return sw_wait_for([this]() {
+            if (TryAcquireSRWLockExclusive(&impl->lock_)) {
+                impl->exclusive_ = true;
+                return true;
+            }
+            return false;
+        }, timeout_msec) ? 0 : ETIMEDOUT;
+    }
+    AcquireSRWLockExclusive(&impl->lock_);
+    impl->exclusive_ = true;
+    return 0;
+}
+
+int Mutex::unlock() {
+    if (impl->exclusive_) {
+        ReleaseSRWLockExclusive(&impl->lock_);
+        impl->exclusive_ = false;
+    }
+    return 0;
+}
+
+Mutex::~Mutex() {
+    // SRWLOCK does not need explicit destruction
+    free_ptr(impl);
+}
+#else
+struct MutexImpl {
+    pthread_mutex_t lock_;
+    pthread_mutexattr_t attr_;
+};
+
+Mutex::Mutex(bool shared) : Lock(MUTEX, shared) {
+    if (shared) {
+        impl = (MutexImpl *) sw_mem_pool()->alloc(sizeof(*impl));
+        if (impl == nullptr) {
+            throw std::bad_alloc();
+        }
+    } else {
+        impl = new MutexImpl();
+    }
+
+    int err = pthread_mutexattr_init(&impl->attr_);
+    if (err != 0) {
+        free_ptr(impl);
+        throw std::system_error(err, std::generic_category(), "pthread_mutexattr_init() failed");
+    }
+    if (shared) {
+        err = pthread_mutexattr_setpshared(&impl->attr_, PTHREAD_PROCESS_SHARED);
+        if (err != 0) {
+            pthread_mutexattr_destroy(&impl->attr_);
+            free_ptr(impl);
+            throw std::system_error(err, std::generic_category(), "pthread_mutexattr_setpshared() failed");
         }
     }
-    return ETIMEDOUT;
+    err = pthread_mutex_init(&impl->lock_, &impl->attr_);
+    if (err != 0) {
+        pthread_mutexattr_destroy(&impl->attr_);
+        free_ptr(impl);
+        throw std::system_error(err, std::generic_category(), "pthread_mutex_init() failed");
+    }
+}
+
+int Mutex::lock(int operation, int timeout_msec) {
+    if (operation & LOCK_NB) {
+        return pthread_mutex_trylock(&impl->lock_);
+    }
+    if (timeout_msec > 0) {
+#ifdef HAVE_MUTEX_TIMEDLOCK
+        timespec timeo;
+        realtime_get(&timeo);
+        realtime_add(&timeo, timeout_msec);
+        return pthread_mutex_timedlock(&impl->lock_, &timeo);
+#else
+        return sw_wait_for([this]() { return pthread_mutex_trylock(&impl->lock_) == 0; }, timeout_msec) ? 0 : ETIMEDOUT;
+#endif
+    }
+    return pthread_mutex_lock(&impl->lock_);
+}
+
+int Mutex::unlock() {
+    return pthread_mutex_unlock(&impl->lock_);
+}
+
+Mutex::~Mutex() {
+    pthread_mutexattr_destroy(&impl->attr_);
+    pthread_mutex_destroy(&impl->lock_);
+    free_ptr(impl);
 }
 #endif
 
-static int swMutex_free(swLock *lock)
-{
-    pthread_mutexattr_destroy(&lock->object.mutex.attr);
-    return pthread_mutex_destroy(&lock->object.mutex._lock);
-}
+}  // namespace swoole

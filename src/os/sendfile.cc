@@ -10,19 +10,54 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
+#include "swoole_socket.h"
 
-#ifdef HAVE_KQUEUE
+#ifdef _WIN32
+// Windows: use TransmitFile for zero-copy sendfile
+ssize_t swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size) {
+    HANDLE hFile = reinterpret_cast<HANDLE>(_get_osfhandle(in_fd));
+    if (hFile == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
 
+    // For now, use read+send as a fallback since TransmitFile
+    // requires the socket to be in a particular state
+    char buf[SW_BUFFER_SIZE_BIG];
+    size_t readn = size > sizeof(buf) ? sizeof(buf) : size;
+    ssize_t n = sw_pread(in_fd, buf, readn, *offset);
+
+    if (n > 0) {
+        ssize_t ret = ::send(out_fd, buf, n, 0);
+        if (ret < 0) {
+            swoole_sys_warning("send() in sendfile failed");
+        } else {
+            *offset += ret;
+        }
+        return ret;
+    } else if (n == 0) {
+        return 0;
+    } else {
+        swoole_sys_warning("pread() in sendfile failed");
+        return SW_ERR;
+    }
+}
+#elif defined(__linux__)
+#include <sys/sendfile.h>
+
+ssize_t swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size) {
+	return sendfile(out_fd, in_fd, offset, size);
+}
+#elif defined(HAVE_SENDFILE) && defined(HAVE_KQUEUE)
+#include <sys/socket.h>
 #include <sys/uio.h>
 
-int swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size)
-{
-    int ret;
+ssize_t swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size) {
+    ssize_t ret;
 
 #ifdef __MACH__
     struct sf_hdtr hdtr;
@@ -34,16 +69,16 @@ int swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size)
     off_t sent_bytes;
 #endif
 
-
-    _do_sendfile:
+_do_sendfile:
 #ifdef __MACH__
     ret = sendfile(in_fd, out_fd, *offset, (off_t *) &size, &hdtr, 0);
 #else
     ret = sendfile(in_fd, out_fd, *offset, size, 0, &sent_bytes, 0);
 #endif
 
-    //sent_bytes = (off_t)size;
-    swTrace("send file, ret:%d, out_fd:%d, in_fd:%d, offset:%jd, size:%zu", ret, out_fd, in_fd, (intmax_t) *offset, size);
+    // sent_bytes = (off_t)size;
+    swoole_trace(
+        "send file, ret: %zd, out_fd:%d, in_fd:%d, offset:%jd, size:%zu", ret, out_fd, in_fd, (intmax_t) *offset, size);
 
 #ifdef __MACH__
     *offset += size;
@@ -51,53 +86,42 @@ int swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size)
     *offset += sent_bytes;
 #endif
 
-    if (ret == -1)
-    {
-        if (errno == EINTR)
-        {
+    if (ret == -1) {
+        if (errno == EINTR) {
             goto _do_sendfile;
-        }
-        else
-        {
+        } else {
             return ret;
         }
-    }
-    else if (ret == 0)
-    {
+    } else if (ret == 0) {
+#ifdef __MACH__
         return size;
-    }
-    else
-    {
-        swSysWarn("sendfile failed");
+#else
+        return sent_bytes;
+#endif
+    } else {
+        swoole_sys_warning("sendfile failed");
         return SW_ERR;
     }
     return SW_OK;
 }
 #elif !defined(HAVE_SENDFILE)
-int swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size)
-{
+ssize_t swoole_sendfile(int out_fd, int in_fd, off_t *offset, size_t size) {
     char buf[SW_BUFFER_SIZE_BIG];
-    int readn = size > sizeof(buf) ? sizeof(buf) : size;
+    size_t readn = size > sizeof(buf) ? sizeof(buf) : size;
+    ssize_t n = sw_pread(in_fd, buf, readn, *offset);
 
-    int ret;
-    int n = pread(in_fd, buf, readn, *offset);
-
-    if (n > 0)
-    {
-        ret = write(out_fd, buf, n);
-        if (ret < 0)
-        {
-            swSysWarn("write() failed");
-        }
-        else
-        {
+    if (n > 0) {
+        ssize_t ret = write(out_fd, buf, n);
+        if (ret < 0) {
+            swoole_sys_warning("write() failed");
+        } else {
             *offset += ret;
         }
         return ret;
-    }
-    else
-    {
-        swSysWarn("pread() failed");
+    } else if (n == 0) {
+        return 0;
+    } else {
+        swoole_sys_warning("pread() failed");
         return SW_ERR;
     }
 }

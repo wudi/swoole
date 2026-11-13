@@ -10,102 +10,126 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole_api.h"
+#include "swoole_reactor.h"
+#include "swoole_client.h"
+#include "swoole_coroutine_socket.h"
+#include "swoole_coroutine_system.h"
+#include "swoole_util.h"
 
-#include <mutex>
-#include <thread>
+using swoole::Callback;
+using swoole::Reactor;
+using swoole::ReactorHandler;
+using swoole::network::Socket;
 
-using namespace std;
-
-static mutex init_lock;
-
-#ifdef __MACH__
-swReactor* sw_reactor()
-{
-    return SwooleTG.reactor;
-}
-#endif
-
-int swoole_event_init()
-{
-    if (!SwooleG.init)
-    {
-        unique_lock<mutex> lock(init_lock);
-        swoole_init();
-    }
-
-    SwooleTG.reactor = (swReactor *) sw_malloc(sizeof(swReactor));
-    if (!SwooleTG.reactor)
-    {
-        swSysWarn("malloc failed");
+int swoole_event_init(int flags) {
+    if (SwooleTG.reactor) {
+        errno = EBUSY;
         return SW_ERR;
     }
-    if (swReactor_create(SwooleTG.reactor, SW_REACTOR_MAXEVENTS) < 0)
-    {
-        sw_free(SwooleTG.reactor);
-        SwooleTG.reactor = nullptr;
+    auto reactor = std::make_unique<Reactor>(SW_REACTOR_MAXEVENTS);
+    if (!reactor->ready()) {
         return SW_ERR;
     }
+
+    if (flags & SW_EVENTLOOP_WAIT_EXIT) {
+        reactor->wait_exit = true;
+    }
+
+    swoole::coroutine::Socket::init_reactor(reactor.get());
+    swoole::coroutine::System::init_reactor(reactor.get());
+    swoole::network::Client::init_reactor(reactor.get());
+
+    SwooleTG.reactor = reactor.release();
+
     return SW_OK;
 }
 
-int swoole_event_add(swSocket *socket, int events)
-{
-    return SwooleTG.reactor->add(SwooleTG.reactor, socket, events);
+int swoole_event_add(Socket *socket, int events) {
+    return SwooleTG.reactor->add(socket, events);
 }
 
-int swoole_event_set(swSocket *socket, int events)
-{
-    return SwooleTG.reactor->set(SwooleTG.reactor, socket, events);
-}
-
-int swoole_event_del(swSocket *socket)
-{
-    return SwooleTG.reactor->del(SwooleTG.reactor, socket);
-}
-
-int swoole_event_wait()
-{
-    swReactor *reactor = SwooleTG.reactor;
-    int retval = 0;
-    if (!reactor->is_empty(reactor))
-    {
-        retval = SwooleTG.reactor->wait(SwooleTG.reactor, nullptr);
+int swoole_event_add_or_update(Socket *_socket, int event) {
+    if (event == SW_EVENT_READ) {
+        return SwooleTG.reactor->add_read_event(_socket);
+    } else if (event == SW_EVENT_WRITE) {
+        return SwooleTG.reactor->add_write_event(_socket);
+    } else {
+        assert(0);
+        return SW_ERR;
     }
-    swoole_event_free();
+}
+
+int swoole_event_set(Socket *socket, int events) {
+    return SwooleTG.reactor->set(socket, events);
+}
+
+int swoole_event_del(Socket *socket) {
+    return SwooleTG.reactor->del(socket);
+}
+
+int swoole_event_wait() {
+    Reactor *reactor = SwooleTG.reactor;
+    if (!swoole_event_is_available()) {
+        return SW_ERR;
+    }
+    if (reactor->is_waiting()) {
+        // Preserve wait()'s reentry error without freeing the running reactor below.
+        return reactor->wait();
+    }
+    ON_SCOPE_EXIT {
+        swoole_event_free();
+    };
+    int retval = 0;
+    if (!reactor->wait_exit || !reactor->if_exit()) {
+        retval = reactor->wait();
+    }
     return retval;
 }
 
-int swoole_event_free()
-{
-    if (!SwooleTG.reactor)
-    {
+int swoole_event_free() {
+    // A worker stopped by a fatal error marks its reactor unavailable, and it must still be freed.
+    // Only a call made while the reactor is being deleted is refused, including direct deletion.
+    if (!SwooleTG.reactor || SwooleTG.reactor->is_destroying()) {
         return SW_ERR;
     }
-    swReactor_destroy(SwooleTG.reactor);
-    sw_free(SwooleTG.reactor);
+    // Destruction marks the reactor unavailable, but internal cleanup still uses this pointer.
+    delete SwooleTG.reactor;
     SwooleTG.reactor = nullptr;
     return SW_OK;
 }
 
-void swoole_event_defer(swCallback cb, void *private_data)
-{
-    SwooleTG.reactor->defer(SwooleTG.reactor, cb, private_data);
+void swoole_event_defer(const Callback &cb, void *private_data) {
+    SwooleTG.reactor->defer(cb, private_data);
 }
 
-/**
- * @return SW_OK or SW_ERR
- */
-int swoole_event_write(swSocket *socket, const void *data, size_t len)
-{
+ssize_t swoole_event_write(Socket *socket, const void *data, size_t len) {
     return SwooleTG.reactor->write(SwooleTG.reactor, socket, data, len);
 }
 
-int swoole_event_set_handler(int fdtype, swReactor_handler handle)
-{
-    return swReactor_set_handler(SwooleTG.reactor, fdtype, handle);
+ssize_t swoole_event_writev(Socket *socket, const iovec *iov, size_t iovcnt) {
+    return SwooleTG.reactor->writev(SwooleTG.reactor, socket, iov, iovcnt);
+}
+
+void swoole_event_set_handler(const int fd_type, const int event, const ReactorHandler handler) {
+    SwooleTG.reactor->set_handler(fd_type, event, handler);
+}
+
+bool swoole_event_isset_handler(const int fd_type, const int event) {
+    return SwooleTG.reactor->isset_handler(fd_type, event);
+}
+
+bool swoole_event_is_available() {
+    return SwooleTG.reactor && !SwooleTG.reactor->destroyed;
+}
+
+bool swoole_event_is_running() {
+    return SwooleTG.reactor && SwooleTG.reactor->running;
+}
+
+Socket *swoole_event_get_socket(int fd) {
+    return SwooleTG.reactor->get_socket(fd);
 }

@@ -10,117 +10,126 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole_api.h"
-#include "wrapper/base.hpp"
-#include "server.h"
+#include "swoole_timer.h"
 
-using namespace std;
-using namespace swoole;
+using swoole::sec2msec;
+using swoole::Timer;
+using swoole::TimerCallback;
+using swoole::TimerNode;
 
-#ifdef __MACH__
-swTimer* sw_timer()
-{
+bool swoole_timer_is_available() {
+    return SwooleTG.timer != nullptr;
+}
+
+TimerNode *swoole_timer_add(double timeout, bool persistent, const TimerCallback &callback, void *private_data) {
+    if (sw_unlikely(timeout < SW_TIMER_MIN_SEC)) {
+        timeout = SW_TIMER_MIN_SEC;
+    }
+    return swoole_timer_add(sec2msec(timeout), persistent, callback, private_data);
+}
+
+Timer *swoole_timer_create(bool manually_trigger) {
+    SwooleTG.timer = new Timer(manually_trigger);
     return SwooleTG.timer;
 }
-#endif
 
-swTimer_node* swoole_timer_add(long ms, uchar persistent, swTimerCallback callback, void *private_data)
-{
-    if (sw_unlikely(SwooleTG.timer == nullptr))
-    {
-        SwooleTG.timer = (swTimer *) sw_malloc(sizeof(swTimer));
-        if (sw_unlikely(SwooleTG.timer == nullptr))
-        {
-            return nullptr;
-        }
-        if (sw_unlikely(swTimer_init(SwooleTG.timer, ms) != SW_OK))
-        {
-            sw_free(SwooleTG.timer);
-            SwooleTG.timer = nullptr;
-            return nullptr;
-        }
+SW_API int64_t swoole_timer_get_next_msec() {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        return -1;
     }
-    return swTimer_add(SwooleTG.timer, ms, persistent, private_data, callback);
+    return SwooleTG.timer->get_next_msec();
 }
 
-uchar swoole_timer_del(swTimer_node* tnode)
-{
-    return swTimer_del(SwooleTG.timer, tnode);
+TimerNode *swoole_timer_add(long ms, bool persistent, const TimerCallback &callback, void *private_data) {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        swoole_timer_create(false);
+    }
+    return SwooleTG.timer->add(ms, persistent, private_data, callback);
 }
 
-long swoole_timer_after(long ms, swTimerCallback callback, void *private_data)
-{
-    if (ms <= 0)
-    {
-        swWarn("Timer must be greater than 0");
-        return SW_ERR;
-    }
-    swTimer_node *tnode = swoole_timer_add(ms, SW_FALSE, callback, private_data);
-    if (tnode == nullptr)
-    {
-        return SW_ERR;
-    }
-    else
-    {
-        return tnode->id;
-    }
-}
-
-long swoole_timer_tick(long ms, swTimerCallback callback, void *private_data)
-{
-    if (ms <= 0)
-    {
-        swWarn("Timer must be greater than 0");
-        return SW_ERR;
-    }
-    swTimer_node *tnode = swoole_timer_add(ms, SW_TRUE, callback, private_data);
-    if (tnode == nullptr)
-    {
-        return SW_ERR;
-    }
-    else
-    {
-        return tnode->id;
-    }
-}
-
-uchar swoole_timer_exists(long timer_id)
-{
-    if (!SwooleTG.timer)
-    {
-        swWarn("no timer");
+bool swoole_timer_del(TimerNode *tnode) {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        swoole_warning("timer is not available");
         return false;
     }
-    swTimer_node *tnode = swTimer_get(SwooleTG.timer, timer_id);
+    return SwooleTG.timer->remove(tnode);
+}
+
+void swoole_timer_delay(TimerNode *tnode, long delay_ms) {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        swoole_warning("timer is not available");
+        return;
+    }
+    return SwooleTG.timer->delay(tnode, delay_ms);
+}
+
+long swoole_timer_after(long ms, const TimerCallback &callback, void *private_data) {
+    if (ms <= 0) {
+        swoole_warning("Timer must be greater than 0");
+        return SW_ERR;
+    }
+    const auto tnode = swoole_timer_add(ms, false, callback, private_data);
+    if (sw_unlikely(!tnode)) {
+        return SW_ERR;
+    }
+    return tnode->id;
+}
+
+long swoole_timer_tick(long ms, const TimerCallback &callback, void *private_data) {
+    if (sw_unlikely(ms <= 0)) {
+        swoole_warning("Timer must be greater than 0");
+        return SW_ERR;
+    }
+    const auto tnode = swoole_timer_add(ms, true, callback, private_data);
+    if (sw_unlikely(!tnode)) {
+        return SW_ERR;
+    }
+    return tnode->id;
+}
+
+bool swoole_timer_exists(long timer_id) {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        swoole_warning("timer is not available");
+        return false;
+    }
+    TimerNode *tnode = SwooleTG.timer->get(timer_id);
     return (tnode && !tnode->removed);
 }
 
-uchar swoole_timer_clear(long timer_id)
-{
-    return swTimer_del(SwooleTG.timer, swTimer_get(SwooleTG.timer, timer_id));
+bool swoole_timer_clear(long timer_id) {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        swoole_warning("timer is not available");
+        return false;
+    }
+    return SwooleTG.timer->remove(SwooleTG.timer->get(timer_id));
 }
 
-swTimer_node* swoole_timer_get(long timer_id)
-{
-    if (!SwooleTG.timer)
-    {
-        swWarn("no timer");
+TimerNode *swoole_timer_get(long timer_id) {
+    if (sw_unlikely(!swoole_timer_is_available())) {
+        swoole_warning("timer is not available");
         return nullptr;
     }
-    return swTimer_get(SwooleTG.timer, timer_id);
+    return SwooleTG.timer->get(timer_id);
 }
 
-void swoole_timer_free()
-{
-    if (!SwooleTG.timer)
-    {
+void swoole_timer_free() {
+    if (!swoole_timer_is_available()) {
+        swoole_print_backtrace();
+        swoole_warning("timer is not available");
         return;
     }
-    swTimer_free(SwooleTG.timer);
-    sw_free(SwooleTG.timer);
+    // Node destructors can run PHP code that uses the timer API, which must not reach the timer being destroyed.
+    Timer *timer = SwooleTG.timer;
     SwooleTG.timer = nullptr;
+    delete timer;
+}
+
+void swoole_timer_select() {
+    if (sw_likely(swoole_timer_is_available())) {
+        SwooleTG.timer->select();
+    }
 }

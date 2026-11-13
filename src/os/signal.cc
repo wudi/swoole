@@ -10,435 +10,454 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole_api.h"
-
-#include "coroutine.h"
-#include "coroutine_system.h"
+#include "swoole_signal.h"
+#include "swoole_socket.h"
+#include "swoole_reactor.h"
 
 #ifdef HAVE_SIGNALFD
 #include <sys/signalfd.h>
 #endif
+
+#include <csignal>
+
 #ifdef HAVE_KQUEUE
+#ifdef USE_KQUEUE_IDE_HELPER
+#include "helper/kqueue.h"
+#else
 #include <sys/event.h>
 #endif
+#endif
+#ifdef __NetBSD__
+#include <sys/param.h>
+#endif
 
-struct swSignal
-{
-    swSignalHandler handler;
-    uint16_t signo;
-    uint16_t active;
-};
+using swoole::Event;
+using swoole::Reactor;
+using swoole::Signal;
+using swoole::SignalHandler;
+using swoole::network::Socket;
 
 #ifdef HAVE_SIGNALFD
-static void swSignalfd_set(int signo, swSignalHandler handler);
-static void swSignalfd_clear();
-static int swSignalfd_onSignal(swReactor *reactor, swEvent *event);
-
-static sigset_t signalfd_mask;
-static int signal_fd = 0;
-static swSocket *signal_socket = nullptr;
+static SignalHandler swoole_signalfd_set(int signo, SignalHandler handler);
+static bool swoole_signalfd_create();
+static bool swoole_signalfd_setup(Reactor *reactor);
+static int swoole_signalfd_event_callback(Reactor *reactor, Event *event);
+static void swoole_signalfd_clear();
 #endif
 
 #ifdef HAVE_KQUEUE
-static void swKqueueSignal_set(int signo, swSignalHandler handler);
+static SignalHandler swoole_signal_kqueue_set(int signo, SignalHandler handler);
+static void swoole_signal_kqueue_clear();
 #endif
 
-static void swSignal_async_handler(int signo);
+static void signal_handler_safety(int signo);
+static void signal_handler_simple(int signo);
 
-static swSignal signals[SW_SIGNO_MAX];
-static int _lock = 0;
+#ifdef HAVE_SIGNALFD
+static sigset_t signalfd_mask;
+static int signal_fd = -1;
+static pid_t signalfd_create_pid;
+static Socket *signal_socket = nullptr;
+static inline bool swoole_signalfd_is_available() {
+    return signal_fd != -1;
+}
+#endif
+static Signal signals[SW_SIGNO_MAX];
+static bool triggered_signals[SW_SIGNO_MAX];
+static struct sigaction origin_actions[SW_SIGNO_MAX];
 
-char* swSignal_str(int sig)
-{
+char *swoole_signal_to_str(int sig) {
     static char buf[64];
     snprintf(buf, sizeof(buf), "%s", strsignal(sig));
-    if (strchr(buf, ':') == 0)
-    {
+    if (strchr(buf, ':') == nullptr) {
         size_t len = strlen(buf);
         snprintf(buf + len, sizeof(buf) - len, ": %d", sig);
     }
     return buf;
 }
 
-/**
- * clear all singal
- */
-void swSignal_none(void)
-{
+bool swoole_signal_block_all() {
+    if (SwooleTG.signal_blocking_all) {
+        return false;
+    }
     sigset_t mask;
     sigfillset(&mask);
-    int ret = pthread_sigmask(SIG_BLOCK, &mask, nullptr);
-    if (ret < 0)
-    {
-        swSysWarn("pthread_sigmask() failed");
+    int ret = pthread_sigmask(SIG_BLOCK, &mask, &SwooleTG.signal_previous_mask);
+    if (ret != 0) {
+        errno = ret;
+        swoole_sys_warning("pthread_sigmask(SIG_BLOCK) failed");
+        return false;
+    }
+    SwooleTG.signal_blocking_all = true;
+    return true;
+}
+
+void swoole_signal_unblock_all() {
+    if (!SwooleTG.signal_blocking_all) {
+        return;
+    }
+    int ret = pthread_sigmask(SIG_SETMASK, &SwooleTG.signal_previous_mask, nullptr);
+    if (ret != 0) {
+        errno = ret;
+        swoole_sys_warning("pthread_sigmask(SIG_SETMASK) failed");
+    } else {
+        SwooleTG.signal_blocking_all = false;
     }
 }
 
 /**
- * setup signal
+ * set new signal handler and return origin signal handler
  */
-swSignalHandler swSignal_set(int sig, swSignalHandler func, int restart, int mask)
-{
-    //ignore
-    if (func == nullptr)
-    {
+SignalHandler swoole_signal_set(int signo, SignalHandler func, int restart, int mask) {
+    // ignore
+    if (func == nullptr) {
         func = SIG_IGN;
     }
-    //clear
-    else if ((long) func == -1)
-    {
+    // clear
+    else if ((long) func == -1) {
         func = SIG_DFL;
     }
 
-    struct sigaction act, oact;
-    act.sa_handler = func;
-    if (mask)
-    {
-        sigfillset(&act.sa_mask);
+    if (func == SIG_IGN || func == SIG_DFL) {
+        signals[signo].handler = nullptr;
+        signals[signo].activated = false;
     }
-    else
-    {
+
+    struct sigaction act{}, oact{};
+    act.sa_handler = func;
+    if (mask) {
+        sigfillset(&act.sa_mask);
+    } else {
         sigemptyset(&act.sa_mask);
     }
     act.sa_flags = 0;
-    if (sigaction(sig, &act, &oact) < 0)
-    {
+    if (restart) {
+        act.sa_flags |= SA_RESTART;
+    }
+#ifdef _WIN32
+    // On Windows, use signal() instead of sigaction()
+    auto old_handler = signal(signo, func);
+    return old_handler == SIG_ERR ? nullptr : old_handler;
+#else
+    if (sigaction(signo, &act, &oact) < 0) {
         return nullptr;
     }
     return oact.sa_handler;
+#endif
 }
 
-void swSignal_add(int signo, swSignalHandler handler)
-{
+SW_API bool swoole_signal_isset(int signo) {
+    return signals[signo].handler && signals[signo].activated;
+}
+
+/**
+ * set new signal handler and return origin signal handler
+ */
+SignalHandler swoole_signal_set(int signo, SignalHandler handler, bool safety) {
 #ifdef HAVE_SIGNALFD
-    if (SwooleG.use_signalfd)
-    {
-        swSignalfd_set(signo, handler);
+    if (SwooleG.enable_signalfd && swoole_event_is_available()) {
+        return swoole_signalfd_set(signo, handler);
     }
-    else
 #endif
-    {
 #ifdef HAVE_KQUEUE
-        // SIGCHLD can not be monitored by kqueue, if blocked by SIG_IGN
-        // see https://www.freebsd.org/cgi/man.cgi?kqueue
-        // if there's no main reactor, signals cannot be monitored either
-        if (signo != SIGCHLD && SwooleTG.reactor)
-        {
-            swKqueueSignal_set(signo, handler);
-        }
-        else
-#endif
-        {
-            signals[signo].handler = handler;
-            signals[signo].active = 1;
-            signals[signo].signo = signo;
-            swSignal_set(signo, swSignal_async_handler, 1, 0);
-        }
+    // SIGCHLD can not be monitored by kqueue, if blocked by SIG_IGN
+    // see https://www.freebsd.org/cgi/man.cgi?kqueue
+    // if there's no main reactor, signals cannot be monitored either
+    if (SwooleG.enable_kqueue && swoole_event_is_available() && signo != SIGCHLD) {
+        return swoole_signal_kqueue_set(signo, handler);
     }
+#endif
+
+    if (handler == nullptr && signals[signo].activated) {
+        sw_memset_zero(&signals[signo], sizeof(Signal));
+        sigaction(signo, &origin_actions[signo], nullptr);
+        return nullptr;
+    }
+    if (!signals[signo].activated) {
+        sigaction(signo, nullptr, &origin_actions[signo]);
+    }
+
+    signals[signo].handler = handler;
+    signals[signo].activated = true;
+    signals[signo].signo = signo;
+    return swoole_signal_set(signo, safety ? signal_handler_safety : signal_handler_simple, 0, 1);
 }
 
-static void swSignal_async_handler(int signo)
-{
-    if (SwooleTG.reactor)
-    {
-        SwooleTG.reactor->singal_no = signo;
-    }
-    else
-    {
-        //discard signal
-        if (_lock)
-        {
+static void signal_handler_safety(int signo) {
+    triggered_signals[signo] = true;
+    SwooleG.signal_dispatch = true;
+}
+
+static void signal_handler_simple(int signo) {
+    if (sw_reactor()) {
+        signal_handler_safety(signo);
+    } else {
+        static int _lock = 0;
+        // discard signal
+        if (_lock) {
             return;
         }
         _lock = 1;
-        swSignal_callback(signo);
+        swoole_signal_callback(signo);
         _lock = 0;
     }
 }
 
-void swSignal_callback(int signo)
-{
-    if (signo >= SW_SIGNO_MAX)
-    {
-        swWarn("signal[%d] numberis invalid", signo);
+void swoole_signal_dispatch() {
+    if (!SwooleG.signal_dispatch) {
         return;
     }
-    swSignalHandler callback = signals[signo].handler;
-    if (!callback)
-    {
-        swoole_error_log(SW_LOG_WARNING, SW_ERROR_UNREGISTERED_SIGNAL, SW_UNREGISTERED_SIGNAL_FMT, swSignal_str(signo));
+    SW_LOOP_N(SW_SIGNO_MAX) {
+        if (triggered_signals[i]) {
+            swoole_signal_callback(i);
+            triggered_signals[i] = false;
+        }
+    }
+    SwooleG.signal_dispatch = false;
+}
+
+void swoole_signal_callback(int signo) {
+    if (signo >= SW_SIGNO_MAX) {
+        swoole_warning("signal[%d] numberis invalid", signo);
+        return;
+    }
+    SignalHandler callback = signals[signo].handler;
+    if (!callback) {
+        swoole_error_log(
+            SW_LOG_WARNING, SW_ERROR_UNREGISTERED_SIGNAL, SW_UNREGISTERED_SIGNAL_FMT, swoole_signal_to_str(signo));
+        return;
+    }
+    if (callback == SIG_IGN || callback == SIG_DFL) {
         return;
     }
     callback(signo);
 }
 
-swSignalHandler swSignal_get_handler(int signo)
-{
-    if (signo >= SW_SIGNO_MAX)
-    {
-        swWarn("signal[%d] numberis invalid", signo);
+SignalHandler swoole_signal_get_handler(int signo) {
+    if (signo >= SW_SIGNO_MAX) {
+        swoole_warning("signal[%d] numberis invalid", signo);
         return nullptr;
-    }
-    else
-    {
+    } else {
         return signals[signo].handler;
     }
 }
 
+uint32_t swoole_signal_get_listener_num() {
+    return SwooleG.signal_listener_num + SwooleG.signal_async_listener_num;
+}
 
-void swSignal_clear(void)
-{
+void swoole_signal_clear() {
 #ifdef HAVE_SIGNALFD
-    if (SwooleG.use_signalfd)
-    {
-        swSignalfd_clear();
+    if (SwooleG.enable_signalfd && swoole_signalfd_is_available()) {
+        swoole_signalfd_clear();
+        return;
     }
-    else
 #endif
-    {
-        int i;
-        for (i = 0; i < SW_SIGNO_MAX; i++)
-        {
-            if (signals[i].active)
-            {
+
 #ifdef HAVE_KQUEUE
-                if (signals[i].signo != SIGCHLD && SwooleTG.reactor)
-                {
-                    swKqueueSignal_set(signals[i].signo, nullptr);
-                }
-                else
+    if (SwooleG.enable_kqueue && swoole_event_is_available()) {
+        swoole_signal_kqueue_clear();
+        return;
+    }
 #endif
-                {
-                    swSignal_set(signals[i].signo, (swSignalHandler) -1, 1, 0);
-                }
-            }
+
+    SW_LOOP_N(SW_SIGNO_MAX) {
+        if (signals[i].activated) {
+            swoole_signal_set(signals[i].signo, reinterpret_cast<SignalHandler>(-1), 1, 0);
         }
     }
-    sw_memset_zero(&signals, sizeof(signals));
+    sw_memset_zero(signals, sizeof(signals));
 }
 
 #ifdef HAVE_SIGNALFD
-void swSignalfd_init()
-{
+void swoole_signalfd_init() {
     sigemptyset(&signalfd_mask);
-    sw_memset_zero(&signals, sizeof(signals));
+    sw_memset_zero(signals, sizeof(signals));
 }
 
-static void swSignalfd_set(int signo, swSignalHandler handler)
-{
-    if (handler == nullptr && signals[signo].active)
-    {
+/**
+ * set new signal handler and return origin signal handler
+ */
+static SignalHandler swoole_signalfd_set(int signo, SignalHandler handler) {
+    SignalHandler origin_handler = nullptr;
+
+    if (handler == nullptr && signals[signo].activated) {
         sigdelset(&signalfd_mask, signo);
-        sw_memset_zero(&signals[signo], sizeof(swSignal));
-    }
-    else
-    {
+        sw_memset_zero(&signals[signo], sizeof(Signal));
+    } else {
         sigaddset(&signalfd_mask, signo);
+        origin_handler = signals[signo].handler;
         signals[signo].handler = handler;
         signals[signo].signo = signo;
-        signals[signo].active = 1;
+        signals[signo].activated = true;
     }
-    if (signal_fd > 0)
-    {
+
+    if (swoole_signalfd_is_available()) {
         sigprocmask(SIG_SETMASK, &signalfd_mask, nullptr);
         signalfd(signal_fd, &signalfd_mask, SFD_NONBLOCK | SFD_CLOEXEC);
     }
-    else if (SwooleTG.reactor)
-    {
-        swSignalfd_setup(SwooleTG.reactor);
-    }
+    swoole_signalfd_setup(sw_reactor());
+
+    return origin_handler;
 }
 
-int swSignalfd_setup(swReactor *reactor)
-{
-    if (signal_fd != 0)
-    {
-        return SW_OK;
+static void swoole_signalfd_close() {
+    if (!swoole_signalfd_is_available()) {
+        return;
+    }
+    signal_socket->fd = SW_BAD_SOCKET;
+    signal_socket->free();
+    close(signal_fd);
+    signal_socket = nullptr;
+    signal_fd = -1;
+}
+
+static bool swoole_signalfd_create() {
+    if (swoole_signalfd_is_available()) {
+        return false;
     }
 
     signal_fd = signalfd(-1, &signalfd_mask, SFD_NONBLOCK | SFD_CLOEXEC);
-    if (signal_fd < 0)
-    {
-        swSysWarn("signalfd() failed");
-        return SW_ERR;
+    if (signal_fd < 0) {
+        swoole_sys_warning("signalfd() failed");
+        return false;
     }
-    signal_socket = swSocket_new(signal_fd, SW_FD_SIGNAL);
-    if (signal_socket == nullptr)
-    {
-        goto _error;
+    signal_socket = swoole::make_socket(signal_fd, SW_FD_SIGNAL);
+    if (sigprocmask(SIG_BLOCK, &signalfd_mask, nullptr) == -1) {
+        swoole_sys_warning("sigprocmask() failed");
+        swoole_signalfd_close();
+        return false;
     }
-    if (sigprocmask(SIG_BLOCK, &signalfd_mask, nullptr) == -1)
-    {
-        swSysWarn("sigprocmask() failed");
-        goto _error;
-    }
-    swReactor_set_handler(reactor, SW_FD_SIGNAL, swSignalfd_onSignal);
-    if (swoole_event_add(signal_socket, SW_EVENT_READ) < 0)
-    {
-        goto _error;
-    }
+    signalfd_create_pid = getpid();
     SwooleG.signal_fd = signal_fd;
-
-    return SW_OK;
-
-    _error:
-    signal_socket->fd = -1;
-    swSocket_free(signal_socket);
-    close(signal_fd);
-    signal_fd = 0;
-
-    return SW_ERR;
-}
-
-static void swSignalfd_clear()
-{
-    if (signal_fd)
-    {
-        if (sigprocmask(SIG_UNBLOCK, &signalfd_mask, nullptr) < 0)
-        {
-            swSysWarn("sigprocmask(SIG_UNBLOCK) failed");
-        }
-        if (signal_socket)
-        {
-            swSocket_free(signal_socket);
-            signal_socket = nullptr;
-        }
-        sw_memset_zero(&signalfd_mask, sizeof(signalfd_mask));
-    }
-    signal_fd = 0;
-}
-
-static int swSignalfd_onSignal(swReactor *reactor, swEvent *event)
-{
-    int n;
-    struct signalfd_siginfo siginfo;
-    n = read(event->fd, &siginfo, sizeof(siginfo));
-    if (n < 0)
-    {
-        swSysWarn("read from signalfd failed");
-        return SW_OK;
-    }
-    if (siginfo.ssi_signo >=  SW_SIGNO_MAX)
-    {
-        swWarn("unknown signal[%d]", siginfo.ssi_signo);
-        return SW_OK;
-    }
-    if (signals[siginfo.ssi_signo].active)
-    {
-        if (signals[siginfo.ssi_signo].handler)
-        {
-            signals[siginfo.ssi_signo].handler(siginfo.ssi_signo);
-        }
-        else
-        {
-            swoole_error_log(SW_LOG_WARNING, SW_ERROR_UNREGISTERED_SIGNAL, SW_UNREGISTERED_SIGNAL_FMT, swSignal_str(siginfo.ssi_signo));
-        }
-    }
-
-    return SW_OK;
-}
-#endif
-
-#ifdef HAVE_KQUEUE
-static void swKqueueSignal_set(int signo, swSignalHandler handler)
-{
-    struct kevent ev;
-    swReactor *reactor = SwooleTG.reactor;
-    struct reactor_object
-    {
-        int fd;
-    };
-    struct reactor_object *reactor_obj = (struct reactor_object *) reactor->object;
-    // clear signal
-    if (handler == nullptr)
-    {
-        signal(signo, SIG_DFL);
-        sw_memset_zero(&signals[signo], sizeof(swSignal));
-        EV_SET(&ev, signo, EVFILT_SIGNAL, EV_DELETE, 0, 0, nullptr);
-    }
-    // add/update signal
-    else
-    {
-        signal(signo, SIG_IGN);
-        signals[signo].handler = handler;
-        signals[signo].signo = signo;
-        signals[signo].active = 1;
-        // save swSignal* as udata
-        EV_SET(&ev, signo, EVFILT_SIGNAL, EV_ADD, 0, 0, &signals[signo]);
-    }
-    int n = kevent(reactor_obj->fd, &ev, 1, nullptr, 0, nullptr);
-    if (n < 0 && sw_unlikely(handler))
-    {
-        swSysWarn("kevent set signal[%d] error", signo);
-    }
-}
-#endif
-
-namespace swoole { namespace coroutine {
-
-bool System::wait_signal(int signo, double timeout)
-{
-    static Coroutine* listeners[SW_SIGNO_MAX];
-    Coroutine *co = Coroutine::get_current_safe();
-
-    if (SwooleTG.reactor->signal_listener_num > 0)
-    {
-        errno = EBUSY;
-        return false;
-    }
-    if (signo < 0 || signo >= SW_SIGNO_MAX || signo == SIGCHLD)
-    {
-        errno = EINVAL;
-        return false;
-    }
-
-    /* resgiter signal */
-    listeners[signo] = co;
-    // for swSignalfd_setup
-    SwooleTG.reactor->check_signalfd = 1;
-    /* always enable signalfd */
-    SwooleG.use_signalfd = SwooleG.enable_signalfd = 1;
-    swSignal_add(signo, [](int signo) {
-        Coroutine *co = listeners[signo];
-        if (co)
-        {
-            listeners[signo] = nullptr;
-            co->resume();
-        }
-    });
-    SwooleTG.reactor->co_signal_listener_num++;
-
-    swTimer_node* timer = nullptr;
-    if (timeout > 0)
-    {
-        timer = swoole_timer_add(timeout * 1000, 0, [](swTimer *timer, swTimer_node *tnode) {
-            Coroutine *co = (Coroutine *) tnode->data;
-            co->resume();
-        }, co);
-    }
-
-    co->yield();
-
-    swSignal_add(signo, nullptr);
-    SwooleTG.reactor->co_signal_listener_num--;
-
-    if (listeners[signo] != nullptr)
-    {
-        listeners[signo] = nullptr;
-        errno = ETIMEDOUT;
-        return false;
-    }
-
-    if (timer)
-    {
-        swoole_timer_del(timer);
-    }
 
     return true;
 }
 
-}}
+bool swoole_signalfd_setup(Reactor *reactor) {
+    if (!swoole_signalfd_is_available() && !swoole_signalfd_create()) {
+        return false;
+    }
+    if (!swoole_event_isset_handler(SW_FD_SIGNAL, SW_EVENT_READ)) {
+        swoole_event_set_handler(SW_FD_SIGNAL, SW_EVENT_READ, swoole_signalfd_event_callback);
+        reactor->set_exit_condition(Reactor::EXIT_CONDITION_SIGNALFD, [](Reactor *reactor, size_t &event_num) -> bool {
+            event_num--;
+            return true;
+        });
+        reactor->add_destroy_callback([](void *) {
+            // child process removes signal socket, parent process will not be able to trigger signal
+            if (signal_socket && signalfd_create_pid == getpid()) {
+                swoole_event_del(signal_socket);
+            }
+        });
+    }
+    if (!(signal_socket->events & SW_EVENT_READ) && swoole_event_add(signal_socket, SW_EVENT_READ) < 0) {
+        return false;
+    }
+    reactor->erase_end_callback(Reactor::PRIORITY_SIGNAL_CALLBACK);
+    return true;
+}
+
+static void swoole_signalfd_clear() {
+    if (!swoole_signalfd_is_available()) {
+        return;
+    }
+
+    if (sigprocmask(SIG_UNBLOCK, &signalfd_mask, nullptr) < 0) {
+        swoole_sys_warning("sigprocmask(SIG_UNBLOCK) failed");
+    }
+    sw_memset_zero(signals, sizeof(signals));
+    sw_memset_zero(&signalfd_mask, sizeof(signalfd_mask));
+
+    swoole_signalfd_close();
+}
+
+static int swoole_signalfd_event_callback(Reactor *reactor, Event *event) {
+    signalfd_siginfo siginfo;
+    ssize_t n = read(event->fd, &siginfo, sizeof(siginfo));
+    if (n < 0) {
+        swoole_sys_warning("read from signalfd failed");
+        return SW_OK;
+    }
+    if (siginfo.ssi_signo >= SW_SIGNO_MAX) {
+        swoole_warning("unknown signal[%d]", siginfo.ssi_signo);
+        return SW_OK;
+    }
+    if (signals[siginfo.ssi_signo].activated) {
+        SignalHandler handler = signals[siginfo.ssi_signo].handler;
+        if (handler == SIG_IGN) {
+            return SW_OK;
+        } else if (handler) {
+            handler(siginfo.ssi_signo);
+        } else {
+            swoole_error_log(SW_LOG_WARNING,
+                             SW_ERROR_UNREGISTERED_SIGNAL,
+                             SW_UNREGISTERED_SIGNAL_FMT,
+                             swoole_signal_to_str(siginfo.ssi_signo));
+        }
+    }
+
+    return SW_OK;
+}
+#endif
+
+#ifdef HAVE_KQUEUE
+/**
+ * set new signal handler and return origin signal handler
+ */
+static SignalHandler swoole_signal_kqueue_set(int signo, SignalHandler handler) {
+    struct kevent ev;
+    SignalHandler origin_handler = nullptr;
+    Reactor *reactor = sw_reactor();
+
+    // clear signal
+    if (handler == nullptr) {
+        if (signals[signo].activated) {
+            sigaction(signo, &origin_actions[signo], nullptr);
+        } else {
+            signal(signo, SIG_DFL);
+        }
+        sw_memset_zero(&signals[signo], sizeof(Signal));
+        EV_SET(&ev, signo, EVFILT_SIGNAL, EV_DELETE, 0, 0, NULL);
+    }
+    // add/update signal
+    else {
+        if (!signals[signo].activated) {
+            sigaction(signo, nullptr, &origin_actions[signo]);
+        }
+        signal(signo, SIG_IGN);
+        origin_handler = signals[signo].handler;
+        signals[signo].handler = handler;
+        signals[signo].signo = signo;
+        signals[signo].activated = true;
+#if !defined(__NetBSD__) || (defined(__NetBSD__) && __NetBSD_Version__ >= 1000000000)
+        auto sigptr = &signals[signo];
+#else
+        auto sigptr = reinterpret_cast<intptr_t>(&signals[signo]);
+#endif
+        // save swSignal* as udata
+        EV_SET(&ev, signo, EVFILT_SIGNAL, EV_ADD, 0, 0, sigptr);
+    }
+    int n = kevent(reactor->native_handle, &ev, 1, nullptr, 0, nullptr);
+    if (n < 0 && sw_unlikely(handler)) {
+        swoole_sys_warning("kevent set signal[%d] error", signo);
+    }
+
+    return origin_handler;
+}
+
+static void swoole_signal_kqueue_clear() {
+    SW_LOOP_N(SW_SIGNO_MAX) {
+        if (signals[i].activated && swoole_event_is_available()) {
+            signals[i].activated = false;
+            signals[i].handler = nullptr;
+            swoole_signal_kqueue_set(signals[i].signo, nullptr);
+        }
+    }
+    sw_memset_zero(signals, sizeof(signals));
+}
+#endif

@@ -10,208 +10,169 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
 #include "swoole.h"
-#include "heap.h"
+#include "swoole_heap.h"
 
-#define left(i)   ((i) << 1)
-#define right(i)  (((i) << 1) + 1)
-#define parent(i) ((i) >> 1)
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 
-static void swHeap_bubble_up(swHeap *heap, uint32_t i);
-static uint32_t swHeap_maxchild(swHeap *heap, uint32_t i);
-static void swHeap_percolate_down(swHeap *heap, uint32_t i);
+namespace swoole {
 
-swHeap *swHeap_new(size_t n, uint8_t type)
-{
-    swHeap *heap = (swHeap *) sw_malloc(sizeof(swHeap));
-    if (!heap)
-    {
-        return nullptr;
-    }
-    if (!(heap->nodes = (swHeap_node **) sw_malloc((n + 1) * sizeof(void *))))
-    {
-        sw_free(heap);
-        return nullptr;
-    }
-    heap->num = 1;
-    heap->size = (n + 1);
-    heap->type = type;
-    return heap;
+static constexpr uint32_t max_heap_size = static_cast<uint32_t>(
+    std::min<size_t>(std::numeric_limits<uint32_t>::max(), std::numeric_limits<size_t>::max() / sizeof(HeapNode *)));
+
+void Heap::NodeArrayDeleter::operator()(HeapNode **ptr) const {
+    sw_free(ptr);
 }
 
-void swHeap_free(swHeap *heap)
-{
-    sw_free(heap->nodes);
-    sw_free(heap);
+Heap::Heap(size_t _n, Type _type) : num(1), size(0), type(_type) {
+    // Slot zero is unused. Both the slot count and its allocation must fit before adding it.
+    if (sw_unlikely(_n >= max_heap_size)) {
+        throw std::length_error("heap capacity is too large");
+    }
+    size = static_cast<uint32_t>(_n + 1);
+    nodes.reset(static_cast<HeapNode **>(sw_malloc(size * sizeof(HeapNode *))));
+    if (sw_unlikely(!nodes)) {
+        throw std::bad_alloc();
+    }
 }
 
-static sw_inline int swHeap_compare(uint8_t type, uint64_t a, uint64_t b)
-{
-    if (type == SW_MIN_HEAP)
-    {
+Heap::~Heap() {
+    for (uint32_t i = 1; i < num; i++) {
+        delete nodes[i];
+    }
+}
+
+int Heap::compare(uint64_t a, uint64_t b) const {
+    if (type == MIN_HEAP) {
         return a > b;
-    }
-    else
-    {
+    } else {
         return a < b;
     }
 }
 
-uint32_t swHeap_size(swHeap *q)
-{
-    return (q->num - 1);
-}
-
-static uint32_t swHeap_maxchild(swHeap *heap, uint32_t i)
-{
-    uint32_t child_i = left(i);
-    if (child_i >= heap->num)
-    {
+uint32_t Heap::maxchild(uint32_t i) const {
+    // Check for a leaf before doubling, so large leaf positions cannot wrap to a live slot.
+    if (i > (num - 1) / 2) {
         return 0;
     }
-    swHeap_node * child_node = heap->nodes[child_i];
-    if ((child_i + 1) < heap->num && swHeap_compare(heap->type, child_node->priority, heap->nodes[child_i + 1]->priority))
-    {
+    uint32_t child_i = i * 2;
+    HeapNode *child_node = nodes[child_i];
+    if ((child_i + 1) < num && compare(child_node->priority, nodes[child_i + 1]->priority)) {
         child_i++;
     }
     return child_i;
 }
 
-static void swHeap_bubble_up(swHeap *heap, uint32_t i)
-{
-    swHeap_node *moving_node = heap->nodes[i];
-    uint32_t parent_i;
-
-    for (parent_i = parent(i);
-            (i > 1) && swHeap_compare(heap->type, heap->nodes[parent_i]->priority, moving_node->priority);
-            i = parent_i, parent_i = parent(i))
-    {
-        heap->nodes[i] = heap->nodes[parent_i];
-        heap->nodes[i]->position = i;
+void Heap::bubble_up(uint32_t i) const {
+    HeapNode *moving_node = nodes[i];
+    for (uint32_t parent_i = i / 2; i > 1 && compare(nodes[parent_i]->priority, moving_node->priority);
+         i = parent_i, parent_i = i / 2) {
+        nodes[i] = nodes[parent_i];
+        nodes[i]->position = i;
     }
 
-    heap->nodes[i] = moving_node;
+    nodes[i] = moving_node;
     moving_node->position = i;
 }
 
-static void swHeap_percolate_down(swHeap *heap, uint32_t i)
-{
+void Heap::percolate_down(uint32_t i) const {
     uint32_t child_i;
-    swHeap_node *moving_node = heap->nodes[i];
+    HeapNode *moving_node = nodes[i];
 
-    while ((child_i = swHeap_maxchild(heap, i))
-            && swHeap_compare(heap->type, moving_node->priority, heap->nodes[child_i]->priority))
-    {
-        heap->nodes[i] = heap->nodes[child_i];
-        heap->nodes[i]->position = i;
+    while ((child_i = maxchild(i)) != 0 && compare(moving_node->priority, nodes[child_i]->priority)) {
+        nodes[i] = nodes[child_i];
+        nodes[i]->position = i;
         i = child_i;
     }
 
-    heap->nodes[i] = moving_node;
+    nodes[i] = moving_node;
     moving_node->position = i;
 }
 
-swHeap_node* swHeap_push(swHeap *heap, uint64_t priority, void *data)
-{
-    void *tmp;
-    uint32_t i;
-    uint32_t newsize;
-
-    if (heap->num >= heap->size)
-    {
-        newsize = heap->size * 2;
-        if (!(tmp = sw_realloc(heap->nodes, sizeof(void *) * newsize)))
-        {
-            return nullptr;
-        }
-        heap->nodes = (swHeap_node **) tmp;
-        heap->size = newsize;
+bool Heap::grow() {
+    if (sw_unlikely(size >= max_heap_size)) {
+        errno = EOVERFLOW;
+        return false;
     }
+    const uint32_t new_size = size > max_heap_size / 2 ? max_heap_size : size * 2;
+    auto *resized = static_cast<HeapNode **>(sw_realloc(nodes.get(), sizeof(HeapNode *) * new_size));
+    if (sw_unlikely(!resized)) {
+        return false;
+    }
+    // realloc has already released or reused the old allocation; only publish the new owner on success.
+    (void) nodes.release();
+    nodes.reset(resized);
+    size = new_size;
+    return true;
+}
 
-    swHeap_node *node = (swHeap_node *) sw_malloc(sizeof(swHeap_node));
-    if (!node)
-    {
+HeapNode *Heap::push(uint64_t priority, void *data) {
+    if (sw_unlikely(num >= size) && !grow()) {
         return nullptr;
     }
-    node->priority = priority;
-    node->data = data;
-    i = heap->num++;
-    heap->nodes[i] = node;
-    swHeap_bubble_up(heap, i);
+
+    auto *node = new HeapNode{priority, num, data};
+    nodes[num++] = node;
+    bubble_up(node->position);
     return node;
 }
 
-void swHeap_change_priority(swHeap *heap, uint64_t new_priority, void* ptr)
-{
-    swHeap_node *node = (swHeap_node *) ptr;
+void Heap::change_priority(uint64_t new_priority, HeapNode *node) const {
+    if (new_priority == node->priority) {
+        return;
+    }
     uint32_t pos = node->position;
     uint64_t old_pri = node->priority;
 
     node->priority = new_priority;
-    if (swHeap_compare(heap->type, old_pri, new_priority))
-    {
-        swHeap_bubble_up(heap, pos);
-    }
-    else
-    {
-        swHeap_percolate_down(heap, pos);
+    if (compare(old_pri, new_priority)) {
+        bubble_up(pos);
+    } else {
+        percolate_down(pos);
     }
 }
 
-void swHeap_remove(swHeap *heap, swHeap_node *node)
-{
+void Heap::remove(HeapNode *node) {
     uint32_t pos = node->position;
-    heap->nodes[pos] = heap->nodes[--heap->num];
-
-    if (swHeap_compare(heap->type, node->priority, heap->nodes[pos]->priority))
-    {
-        swHeap_bubble_up(heap, pos);
+    uint32_t last = --num;
+    auto *replacement = nodes[last];
+    nodes[last] = nullptr;
+    if (pos != last) {
+        nodes[pos] = replacement;
+        if (compare(node->priority, replacement->priority)) {
+            bubble_up(pos);
+        } else {
+            percolate_down(pos);
+        }
     }
-    else
-    {
-        swHeap_percolate_down(heap, pos);
-    }
+    delete node;
 }
 
-void *swHeap_pop(swHeap *heap)
-{
-    swHeap_node *head;
-    if (!heap || heap->num == 1)
-    {
+void *Heap::pop() {
+    auto *head = top();
+    if (!head) {
         return nullptr;
     }
 
-    head = heap->nodes[1];
-    heap->nodes[1] = heap->nodes[--heap->num];
-    swHeap_percolate_down(heap, 1);
-
     void *data = head->data;
-    sw_free(head);
+    remove(head);
     return data;
 }
 
-void *swHeap_peek(swHeap *heap)
-{
-    if (heap->num == 1)
-    {
-        return nullptr;
-    }
-    swHeap_node *node = heap->nodes[1];
-    if (!node)
-    {
-        return nullptr;
-    }
-    return node->data;
+void *Heap::peek() const {
+    const auto *node = top();
+    return node ? node->data : nullptr;
 }
 
-void swHeap_print(swHeap *heap)
-{
-    for(uint32_t i = 1; i < heap->num; i++)
-    {
-        printf("#%d\tpriority=%ld, data=%p\n", i, (long)heap->nodes[i]->priority, heap->nodes[i]->data);
+void Heap::print() const {
+    for (uint32_t i = 1; i < num; i++) {
+        printf("#%u\tpriority=%" PRIu64 ", data=%p\n", i, nodes[i]->priority, nodes[i]->data);
     }
 }
+}  // namespace swoole

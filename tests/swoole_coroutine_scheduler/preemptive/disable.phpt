@@ -3,6 +3,7 @@ swoole_coroutine_scheduler/preemptive: swoole_coroutine_scheduler/disable
 --SKIPIF--
 <?php 
 require __DIR__ . '/../../include/skipif.inc';
+skip_if_not_linux();
 ?>
 --FILE--
 <?php
@@ -10,7 +11,11 @@ require __DIR__ . '/../../include/bootstrap.php';
 
 $default = 10;
 $max_msec = 10;
-co::set(['enable_preemptive_scheduler' => true]);
+
+co::set([
+    'enable_preemptive_scheduler' => true, 
+    'hook_flags' => 0,
+]);
 
 $start = microtime(1);
 echo "start\n";
@@ -41,7 +46,7 @@ go(function () use (&$flag) {
     $flag = false;
 });
 echo "end\n";
-swoole_event::wait();
+Swoole\Event::wait();
 ?>
 --EXPECTF--
 start

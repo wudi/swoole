@@ -10,177 +10,144 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
-#include "swoole.h"
-#include <sys/shm.h>
+#include "swoole_memory.h"
 
-void* sw_shm_malloc(size_t size)
-{
+#include <limits>
+
+#ifndef _WIN32
+#include <sys/mman.h>
+
+#if defined(MAP_ANON) && !defined(MAP_ANONYMOUS)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
+
+namespace swoole {
+
+struct SharedMemory {
+    size_t size_;
+
+    static void *alloc(size_t size);
+    static void free(void *ptr);
+
+    static SharedMemory *fetch_object(void *ptr) {
+        return reinterpret_cast<SharedMemory *>(static_cast<char *>(ptr) - sizeof(SharedMemory));
+    }
+};
+
+void *SharedMemory::alloc(size_t size) {
+    void *mem;
+    SharedMemory object;
+
+    if (sw_unlikely(size > std::numeric_limits<size_t>::max() - SW_DEFAULT_ALIGNMENT + 1)) {
+        return nullptr;
+    }
     size = SW_MEM_ALIGNED_SIZE(size);
-    swShareMemory object;
-    void *mem;
-    size += sizeof(swShareMemory);
-    mem = swShareMemory_mmap_create(&object, size, nullptr);
-    if (mem == nullptr)
-    {
+    if (sw_unlikely(size > std::numeric_limits<size_t>::max() - sizeof(SharedMemory))) {
         return nullptr;
     }
-    else
-    {
-        memcpy(mem, &object, sizeof(swShareMemory));
-        return (char *) mem + sizeof(swShareMemory);
-    }
-}
+    size += sizeof(SharedMemory);
 
-void* sw_shm_calloc(size_t num, size_t _size)
-{
-    swShareMemory object;
-    void *mem;
-    void *ret_mem;
-    size_t size = sizeof(swShareMemory) + (num * _size);
-    size = SW_MEM_ALIGNED_SIZE(size);
-
-    mem = swShareMemory_mmap_create(&object, size, nullptr);
-    if (mem == nullptr)
-    {
-        return nullptr;
-    }
-    else
-    {
-        memcpy(mem, &object, sizeof(swShareMemory));
-        ret_mem = (char *) mem + sizeof(swShareMemory);
-        sw_memset_zero(ret_mem, size - sizeof(swShareMemory));
-        return ret_mem;
-    }
-}
-
-int sw_shm_protect(void *addr, int flags)
-{
-    swShareMemory *object = (swShareMemory *) ((char *) addr - sizeof(swShareMemory));
-    return mprotect(object, object->size, flags);
-}
-
-void sw_shm_free(void *ptr)
-{
-    swShareMemory *object = (swShareMemory *) ((char *) ptr - sizeof(swShareMemory));
-    swShareMemory_mmap_free(object);
-}
-
-void* sw_shm_realloc(void *ptr, size_t new_size)
-{
-    swShareMemory *object = (swShareMemory *) ((char *) ptr - sizeof(swShareMemory));
-    void *new_ptr;
-    new_ptr = sw_shm_malloc(new_size);
-    if (new_ptr == nullptr)
-    {
-        return nullptr;
-    }
-    else
-    {
-        memcpy(new_ptr, ptr, object->size);
-        sw_shm_free(ptr);
-        return new_ptr;
-    }
-}
-
-void *swShareMemory_mmap_create(swShareMemory *object, size_t size, const char *mapfile)
-{
-    void *mem;
-    int tmpfd = -1;
-    int flag = MAP_SHARED;
-    sw_memset_zero(object, sizeof(swShareMemory));
-
-#ifdef MAP_ANONYMOUS
-    flag |= MAP_ANONYMOUS;
+#ifdef _WIN32
+    mem = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem)
 #else
-    if (mapfile == nullptr)
-    {
-        mapfile = "/dev/zero";
-    }
-    if ((tmpfd = open(mapfile, O_RDWR)) < 0)
-    {
+    int tmpfd = -1;
+    int flags = MAP_SHARED;
+#ifdef MAP_ANONYMOUS
+    flags |= MAP_ANONYMOUS;
+#else
+    File zerofile("/dev/zero", O_RDWR);
+    if (!zerofile.ready()) {
         return nullptr;
     }
-    strncpy(object->mapfile, mapfile, SW_SHM_MMAP_FILE_LEN);
-    object->tmpfd = tmpfd;
+    tmpfd = zerofile.get_fd();
 #endif
-
-#if defined(SW_USE_HUGEPAGE) && defined(MAP_HUGE_PAGE)
-    if (size > 2 * 1024 * 1024)
-    {
-#if defined(MAP_HUGETLD)
-        flag |= MAP_HUGETLB;
-#elif defined(MAP_ALIGNED_SUPER)
-        flag &= ~MAP_ANONYMOUS;
-        flag |= MAP_ALIGNED_SUPER;
-#endif
-    }
-#endif
-
-    mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, flag, tmpfd, 0);
+    mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, tmpfd, 0);
 #ifdef MAP_FAILED
     if (mem == MAP_FAILED)
 #else
     if (!mem)
 #endif
+#endif
     {
-        swSysWarn("mmap(%ld) failed", size);
+        swoole_sys_warning("mmap(%lu) failed", size);
         return nullptr;
-    }
-    else
-    {
-        object->size = size;
-        object->mem = mem;
-        return mem;
+    } else {
+        object.size_ = size;
+        memcpy(mem, &object, sizeof(object));
+        return static_cast<char *>(mem) + sizeof(object);
     }
 }
 
-int swShareMemory_mmap_free(swShareMemory *object)
-{
-    return munmap(object->mem, object->size);
+void SharedMemory::free(void *ptr) {
+    SharedMemory *object = SharedMemory::fetch_object(ptr);
+    size_t size = object->size_;
+#ifdef _WIN32
+    if (!VirtualFree(object, 0, MEM_RELEASE)) {
+        swoole_sys_warning("VirtualFree(%p, %lu) failed", object, size);
+    }
+#else
+    if (munmap(object, size) < 0) {
+        swoole_sys_warning("munmap(%p, %lu) failed", object, size);
+    }
+#endif
 }
 
-void *swShareMemory_sysv_create(swShareMemory *object, size_t size, int key)
-{
-    int shmid;
-    void *mem;
-    sw_memset_zero(object, sizeof(swShareMemory));
+}  // namespace swoole
 
-    if (key == 0)
-    {
-        key = IPC_PRIVATE;
-    }
-    //SHM_R | SHM_W
-    if ((shmid = shmget(key, size, IPC_CREAT)) < 0)
-    {
-        swSysWarn("shmget(%d, %ld) failed", key, size);
-        return nullptr;
-    }
-    if ((mem = shmat(shmid, nullptr, 0)) == (void *) -1)
-    {
-        swSysWarn("shmat() failed");
-        return nullptr;
-    }
-    else
-    {
-        object->key = key;
-        object->shmid = shmid;
-        object->size = size;
-        object->mem = mem;
-        return mem;
-    }
+using swoole::SharedMemory;
+
+void *sw_shm_malloc(size_t size) {
+    return SharedMemory::alloc(size);
 }
 
-int swShareMemory_sysv_free(swShareMemory *object, int rm)
-{
-    int shmid = object->shmid;
-    int ret = shmdt(object->mem);
-    if (rm == 1)
-    {
-        shmctl(shmid, IPC_RMID, nullptr);
+void *sw_shm_calloc(size_t num, size_t _size) {
+    if (sw_unlikely(num != 0 && _size > std::numeric_limits<size_t>::max() / num)) {
+        return nullptr;
     }
-    return ret;
+    // mmap MAP_ANONYMOUS / VirtualAlloc guarantee zero-filled pages, so no explicit memset needed
+    return SharedMemory::alloc(num * _size);
+}
+
+int sw_shm_protect(void *ptr, int flags) {
+    SharedMemory *object = SharedMemory::fetch_object(ptr);
+#ifdef _WIN32
+    DWORD winprot;
+    if ((flags & PROT_READ) && (flags & PROT_WRITE)) {
+        winprot = PAGE_READWRITE;
+    } else if (flags & PROT_READ) {
+        winprot = PAGE_READONLY;
+    } else {
+        winprot = PAGE_NOACCESS;
+    }
+    DWORD oldprot;
+    return VirtualProtect(object, object->size_, winprot, &oldprot) ? 0 : -1;
+#else
+    return mprotect(object, object->size_, flags);
+#endif
+}
+
+void sw_shm_free(void *ptr) {
+    SharedMemory::free(ptr);
+}
+
+void *sw_shm_realloc(void *ptr, size_t new_size) {
+    SharedMemory *object = SharedMemory::fetch_object(ptr);
+    size_t old_size = object->size_ - sizeof(SharedMemory);
+    if (sw_unlikely(new_size < old_size)) {
+        // Shared memory realloc is grow-only; callers must allocate/copy/free explicitly to shrink.
+        return nullptr;
+    }
+    void *new_ptr = sw_shm_malloc(new_size);
+    if (new_ptr == nullptr) {
+        return nullptr;
+    }
+    memcpy(new_ptr, ptr, old_size);
+    SharedMemory::free(ptr);
+    return new_ptr;
 }

@@ -6,31 +6,24 @@ swoole_coroutine_util: fgets
 <?php
 require __DIR__ . '/../include/bootstrap.php';
 
-go(function () {
-    $file = __DIR__ . '/../../swoole.cc';
+Co\run(function () {
+    $file = __DIR__ . '/../../examples/server/mixed.php';
 
-    $coroutine = '';
+    Swoole\Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
+    $coroutine = [];
     $fp = fopen($file, "r");
     while (!feof($fp)) {
-        $coroutine .= co::fgets($fp);
+        $coroutine [] = fgets($fp);
     }
 
-    $standard = '';
+    Swoole\Runtime::enableCoroutine(false);
+    $standard = [];
     $fp = fopen($file, "r");
     while (!feof($fp)) {
-        $standard .= fgets($fp);
-    }
-
-    Swoole\Runtime::enableCoroutine();
-    $runtime = '';
-    $fp = fopen($file, "r");
-    while (!feof($fp)) {
-        $runtime .= fgets($fp);
+        $standard [] = fgets($fp);
     }
 
     Assert::same($standard, $coroutine);
-    Assert::same($standard, $runtime);
-
     echo "DONE\n";
 });
 ?>
